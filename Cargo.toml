@@ -1,0 +1,20 @@
+[package]
+name = "ndn-app"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bytes = "1.5.0"
+log = "0.4.20"
+ndn-ndnlp = { version = "0.1.0", path = "../ndn-ndnlp" }
+ndn-nfd-mgmt = { version = "0.1.0", path = "../ndn-nfd-mgmt" }
+ndn-protocol = { version = "0.3.0", path = "../ndn-protocol" }
+ndn-tlv = { version = "0.3.0", path = "../ndn-tlv" }
+thiserror = "1.0.57"
+tokio = { version = "1.36.0", features = ["net", "sync", "io-util"] }
+
+[dev-dependencies]
+base64 = "0.21.7"
+tokio = { version = "1.36.0", features = ["full"] }
