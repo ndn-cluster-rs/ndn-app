@@ -5,10 +5,24 @@ use bytes::{Buf, Bytes};
 use derive_more::Constructor;
 use ndn_protocol::{
     signature::{KeyLocatorData, SignMethod},
-    Data, Interest,
+    Data, DigestSha256, Interest,
 };
 use tokio::sync::RwLock;
 use type_map::concurrent::TypeMap;
+
+/// A simple verifier that will allow unsigned and signed interests, but will make sure a
+/// DigestSha256-signed interest has a valid digest
+pub const SIMPLE_VERIFIER: OrVerifier<ForbidDigestSignature, RequireValidSignature<DigestSha256>> =
+    OrVerifier(
+        ForbidDigestSignature,
+        RequireValidSignature(DigestSha256::new()),
+    );
+
+/// Same as `SIMPLE_VERIFIER`, but does not allow unsigned interests
+pub const SIMPLE_SIGNED: AndVerifier<
+    ForbidUnsigned,
+    OrVerifier<ForbidDigestSignature, RequireValidSignature<DigestSha256>>,
+> = AndVerifier(ForbidUnsigned, SIMPLE_VERIFIER);
 
 #[async_trait]
 pub trait InterestVerifier {
@@ -22,17 +36,11 @@ pub trait DataVerifier {
 
 pub trait VerifierEx: Sized {
     fn or<T: Sized>(self, other: T) -> OrVerifier<Self, T> {
-        OrVerifier {
-            verifier1: self,
-            verifier2: other,
-        }
+        OrVerifier(self, other)
     }
 
     fn and<T: Sized>(self, other: T) -> AndVerifier<Self, T> {
-        AndVerifier {
-            verifier1: self,
-            verifier2: other,
-        }
+        AndVerifier(self, other)
     }
 }
 
@@ -75,10 +83,7 @@ impl InterestVerifier for ForbidAll {
 impl VerifierEx for ForbidAll {}
 
 #[derive(Debug, Clone, Copy, Hash, Constructor, Default)]
-pub struct OrVerifier<T, U> {
-    verifier1: T,
-    verifier2: U,
-}
+pub struct OrVerifier<T, U>(T, U);
 
 #[async_trait]
 impl<T, U> DataVerifier for OrVerifier<T, U>
@@ -87,8 +92,8 @@ where
     U: DataVerifier + Sync,
 {
     async fn verify(&self, data: &Data<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
-        let res1 = self.verifier1.verify(data, Arc::clone(&context)).await;
-        let res2 = self.verifier2.verify(data, context).await;
+        let res1 = self.0.verify(data, Arc::clone(&context)).await;
+        let res2 = self.1.verify(data, context).await;
         res1 || res2
     }
 }
@@ -100,8 +105,8 @@ where
     U: InterestVerifier + Sync,
 {
     async fn verify(&self, interest: &Interest<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
-        let res1 = self.verifier1.verify(interest, Arc::clone(&context)).await;
-        let res2 = self.verifier2.verify(interest, context).await;
+        let res1 = self.0.verify(interest, Arc::clone(&context)).await;
+        let res2 = self.1.verify(interest, context).await;
         res1 || res2
     }
 }
@@ -109,10 +114,7 @@ where
 impl<T, U> VerifierEx for OrVerifier<T, U> {}
 
 #[derive(Debug, Clone, Copy, Hash, Constructor, Default)]
-pub struct AndVerifier<T, U> {
-    verifier1: T,
-    verifier2: U,
-}
+pub struct AndVerifier<T, U>(T, U);
 
 #[async_trait]
 impl<T, U> DataVerifier for AndVerifier<T, U>
@@ -121,8 +123,8 @@ where
     U: DataVerifier + Sync,
 {
     async fn verify(&self, data: &Data<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
-        let res1 = self.verifier1.verify(data, Arc::clone(&context)).await;
-        let res2 = self.verifier2.verify(data, context).await;
+        let res1 = self.0.verify(data, Arc::clone(&context)).await;
+        let res2 = self.1.verify(data, context).await;
         res1 && res2
     }
 }
@@ -134,8 +136,8 @@ where
     U: InterestVerifier + Sync,
 {
     async fn verify(&self, interest: &Interest<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
-        let res1 = self.verifier1.verify(interest, Arc::clone(&context)).await;
-        let res2 = self.verifier2.verify(interest, context).await;
+        let res1 = self.0.verify(interest, Arc::clone(&context)).await;
+        let res2 = self.1.verify(interest, context).await;
         res1 && res2
     }
 }
