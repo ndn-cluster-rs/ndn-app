@@ -21,54 +21,65 @@ enum Connector {
     Unix(String),
 }
 
-trait InterestCallback {
+trait InterestCallback<Context> {
     fn run(
         &self,
         handler: AppHandler,
         interest: Interest<Bytes>,
+        context: Context,
     ) -> Pin<Box<dyn Future<Output = Option<Data<Bytes>>> + Send + 'static>>;
 }
 
-impl<F, G> InterestCallback for F
+impl<F, G, Context> InterestCallback<Context> for F
 where
-    F: Fn(AppHandler, Interest<Bytes>) -> G,
+    F: Fn(AppHandler, Interest<Bytes>, Context) -> G,
     G: Future<Output = Option<Data<Bytes>>> + Send + 'static,
 {
     fn run(
         &self,
         handler: AppHandler,
         interest: Interest<Bytes>,
+        context: Context,
     ) -> Pin<Box<(dyn Future<Output = Option<Data<Bytes>>> + Send)>> {
-        Box::pin(self(handler, interest))
+        Box::pin(self(handler, interest, context))
     }
 }
 
-trait OnStartFn {
-    fn run(&self, handler: AppHandler) -> Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
+trait OnStartFn<Context> {
+    fn run(
+        &self,
+        handler: AppHandler,
+        context: Context,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
 }
 
-impl<F, G> OnStartFn for F
+impl<F, G, Context> OnStartFn<Context> for F
 where
     F: Send + Sync,
-    F: Fn(AppHandler) -> G,
+    F: Fn(AppHandler, Context) -> G,
     G: Future<Output = ()> + 'static + Send + Sync,
 {
-    fn run(&self, handler: AppHandler) -> Pin<Box<dyn Future<Output = ()> + Send + Sync>> {
-        Box::pin(self(handler))
+    fn run(
+        &self,
+        handler: AppHandler,
+        context: Context,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + Sync>> {
+        Box::pin(self(handler, context))
     }
 }
 
-pub struct RouteHandler {
-    callback: Box<dyn InterestCallback + Send + Sync>,
+pub struct RouteHandler<Context> {
+    callback: Box<dyn InterestCallback<Context> + Send + Sync>,
     verifier: Box<dyn InterestVerifier + Send + Sync>,
 }
 
-pub struct App<S, Routes> {
+pub struct App<S, Context, Routes> {
     routes: Routes,
-    on_start: Option<Box<dyn OnStartFn>>,
+    on_start: Option<Box<dyn OnStartFn<Context>>>,
     connector: Connector,
     signer: Arc<RwLock<S>>,
     verifier_context: Arc<RwLock<TypeMap>>,
+    context: Context,
 }
 
 struct InterestToSend<T> {
@@ -137,24 +148,26 @@ impl AppHandler {
     }
 }
 
-impl<S> App<S, BTreeMap<Name, RouteHandler>>
+impl<S, Context> App<S, Context, BTreeMap<Name, RouteHandler<Context>>>
 where
     S: SignMethod + Send + Sync + 'static,
+    Context: Clone + Send + 'static,
 {
-    pub fn new(signer: S) -> Self {
+    pub fn new(signer: S, context: Context) -> Self {
         Self {
             routes: BTreeMap::new(),
             connector: Connector::Unix("/var/run/nfd/nfd.sock".to_string()),
             signer: Arc::new(RwLock::new(signer)),
             on_start: None,
             verifier_context: Arc::new(RwLock::new(TypeMap::new())),
+            context,
         }
     }
 
     #[allow(private_bounds)]
     pub fn route<CB, Ver>(mut self, name: impl ToName, verifier: Ver, func: CB) -> Self
     where
-        CB: InterestCallback + Send + Sync + 'static,
+        CB: InterestCallback<Context> + Send + Sync + 'static,
         Ver: InterestVerifier + Send + Sync + 'static,
     {
         self.routes.insert(
@@ -170,7 +183,7 @@ where
     #[allow(private_bounds)]
     pub fn on_start<F>(mut self, on_start: F) -> Self
     where
-        F: OnStartFn + 'static,
+        F: OnStartFn<Context> + 'static,
     {
         self.on_start = Some(Box::new(on_start));
         self
@@ -180,28 +193,31 @@ where
         self.initialise().start().await
     }
 
-    fn initialise(self) -> App<S, Arc<RwLock<BTreeMap<Name, RouteHandler>>>> {
+    fn initialise(self) -> App<S, Context, Arc<RwLock<BTreeMap<Name, RouteHandler<Context>>>>> {
         App {
             routes: Arc::new(RwLock::new(self.routes)),
             on_start: self.on_start,
             connector: self.connector,
             signer: self.signer,
             verifier_context: self.verifier_context,
+            context: self.context,
         }
     }
 }
 
-impl<S> App<S, Arc<RwLock<BTreeMap<Name, RouteHandler>>>>
+impl<S, Context> App<S, Context, Arc<RwLock<BTreeMap<Name, RouteHandler<Context>>>>>
 where
     S: SignMethod + Send + Sync + 'static,
+    Context: Clone + Send + 'static,
 {
     async fn handle_interest(
         interest: Interest<Bytes>,
-        routes: Arc<RwLock<BTreeMap<Name, RouteHandler>>>,
+        routes: Arc<RwLock<BTreeMap<Name, RouteHandler<Context>>>>,
         verifier_context: Arc<RwLock<TypeMap>>,
         app_handler: AppHandler,
         signer: Arc<RwLock<S>>,
         out_sender: mpsc::Sender<Packet>,
+        context: Context,
     ) -> Result<()> {
         let routes = routes.read().await;
         let interest_uri = interest.name().to_uri();
@@ -221,7 +237,7 @@ where
                 }
                 if let Some(mut ret) = route_handler
                     .callback
-                    .run(app_handler.clone(), interest.clone()) // TODO
+                    .run(app_handler.clone(), interest.clone(), context.clone()) // TODO
                     .await
                 {
                     if !ret.is_signed() {
@@ -317,7 +333,7 @@ where
         };
 
         if let Some(on_start) = self.on_start.take() {
-            tokio::spawn(on_start.run(app_handler.clone()));
+            tokio::spawn(on_start.run(app_handler.clone(), self.context.clone()));
         }
 
         loop {
@@ -331,6 +347,7 @@ where
                             app_handler.clone(),
                             Arc::clone(&self.signer),
                             out_sender.clone(),
+                            self.context.clone(),
                         ));
                     }
                 }
