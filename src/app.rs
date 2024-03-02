@@ -273,7 +273,7 @@ where
         Ok(())
     }
 
-    pub async fn start(mut self) -> Result<()> {
+    async fn start(mut self) -> Result<()> {
         let (reader, writer): (
             Box<dyn AsyncRead + Unpin + Send>,
             Box<dyn AsyncWrite + Unpin + Send>,
