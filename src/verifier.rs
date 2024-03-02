@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
+use derive_more::Constructor;
 use ndn_protocol::{
     signature::{KeyLocatorData, SignMethod},
     Data, Interest,
@@ -19,7 +20,26 @@ pub trait DataVerifier {
     async fn verify(&self, data: &Data<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool;
 }
 
+pub trait VerifierEx: Sized {
+    fn or<T: Sized>(self, other: T) -> OrVerifier<Self, T> {
+        OrVerifier {
+            verifier1: self,
+            verifier2: other,
+        }
+    }
+
+    fn and<T: Sized>(self, other: T) -> AndVerifier<Self, T> {
+        AndVerifier {
+            verifier1: self,
+            verifier2: other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Hash, Constructor, Default)]
 pub struct AllowAll;
+
+impl VerifierEx for AllowAll {}
 
 #[async_trait]
 impl DataVerifier for AllowAll {
@@ -35,6 +55,7 @@ impl InterestVerifier for AllowAll {
     }
 }
 
+#[derive(Debug, Clone, Copy, Hash, Constructor, Default)]
 pub struct ForbidAll;
 
 #[async_trait]
@@ -51,18 +72,12 @@ impl InterestVerifier for ForbidAll {
     }
 }
 
+impl VerifierEx for ForbidAll {}
+
+#[derive(Debug, Clone, Copy, Hash, Constructor, Default)]
 pub struct OrVerifier<T, U> {
     verifier1: T,
     verifier2: U,
-}
-
-impl<T, U> OrVerifier<T, U> {
-    pub fn new(verifier1: T, verifier2: U) -> Self {
-        Self {
-            verifier1,
-            verifier2,
-        }
-    }
 }
 
 #[async_trait]
@@ -75,15 +90,6 @@ where
         let res1 = self.verifier1.verify(data, Arc::clone(&context)).await;
         let res2 = self.verifier2.verify(data, context).await;
         res1 || res2
-    }
-}
-
-impl<T, U> AndVerifier<T, U> {
-    pub fn new(verifier1: T, verifier2: U) -> Self {
-        Self {
-            verifier1,
-            verifier2,
-        }
     }
 }
 
@@ -100,6 +106,9 @@ where
     }
 }
 
+impl<T, U> VerifierEx for OrVerifier<T, U> {}
+
+#[derive(Debug, Clone, Copy, Hash, Constructor, Default)]
 pub struct AndVerifier<T, U> {
     verifier1: T,
     verifier2: U,
@@ -131,44 +140,39 @@ where
     }
 }
 
-pub struct ValidSignature<Method: Send + Sync> {
-    method: Method,
-}
+impl<T, U> VerifierEx for AndVerifier<T, U> {}
 
-impl<Method> ValidSignature<Method>
-where
-    Method: Send + Sync,
-{
-    pub fn new(method: Method) -> Self {
-        Self { method }
-    }
-}
+#[derive(Debug, Clone, Copy, Hash, Default)]
+pub struct RequireValidSignature<Method: Send + Sync>(pub Method);
 
 #[async_trait]
-impl<Method> InterestVerifier for ValidSignature<Method>
+impl<Method> InterestVerifier for RequireValidSignature<Method>
 where
     Method: SignMethod + Send + Sync,
     Method::Certificate: Clone,
 {
     async fn verify(&self, interest: &Interest<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
         interest
-            .verify_with_sign_method(&self.method, self.method.certificate().clone())
+            .verify_with_sign_method(&self.0, self.0.certificate().clone())
             .is_ok()
     }
 }
 
 #[async_trait]
-impl<Method> DataVerifier for ValidSignature<Method>
+impl<Method> DataVerifier for RequireValidSignature<Method>
 where
     Method: SignMethod + Send + Sync,
     Method::Certificate: Clone,
 {
     async fn verify(&self, data: &Data<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
-        data.verify_with_sign_method(&self.method, self.method.certificate().clone())
+        data.verify_with_sign_method(&self.0, self.0.certificate().clone())
             .is_ok()
     }
 }
 
+impl<T: Send + Sync> VerifierEx for RequireValidSignature<T> {}
+
+#[derive(Debug, Clone, Copy, Hash, Constructor, Default)]
 pub struct ForbidDigestSignature;
 
 #[async_trait]
@@ -193,6 +197,9 @@ impl DataVerifier for ForbidDigestSignature {
     }
 }
 
+impl VerifierEx for ForbidDigestSignature {}
+
+#[derive(Debug, Clone, Copy, Hash, Constructor, Default)]
 pub struct ForbidUnsigned;
 
 #[async_trait]
@@ -209,11 +216,18 @@ impl DataVerifier for ForbidUnsigned {
     }
 }
 
+impl VerifierEx for ForbidUnsigned {}
+
+#[derive(Debug, Clone, Copy, Hash, Constructor, Default)]
 pub struct RequireValidNonce;
 
-struct ValidNonceContext {
-    used_nonces: HashMap<(u64, Option<KeyLocatorData>), [Option<Bytes>; Self::BUFFER_SIZE]>,
+struct NonceList<const N: usize> {
+    nonces: [Option<Bytes>; N],
     buffer_pos: usize,
+}
+
+struct ValidNonceContext {
+    used_nonces: HashMap<(u64, Option<KeyLocatorData>), NonceList<{ Self::BUFFER_SIZE }>>,
 }
 
 impl ValidNonceContext {
@@ -249,7 +263,6 @@ impl InterestVerifier for RequireValidNonce {
             if !context.contains::<ValidNonceContext>() {
                 let verifier_context = ValidNonceContext {
                     used_nonces: HashMap::new(),
-                    buffer_pos: 0,
                 };
                 context.insert(verifier_context);
             }
@@ -260,19 +273,82 @@ impl InterestVerifier for RequireValidNonce {
             used_nonces
         } else {
             const NONE: Option<Bytes> = None;
-            let used_nonces = [NONE; ValidNonceContext::BUFFER_SIZE];
+            let used_nonces = NonceList {
+                nonces: [NONE; ValidNonceContext::BUFFER_SIZE],
+                buffer_pos: 0,
+            };
             verifier_context
                 .used_nonces
                 .insert(key.clone(), used_nonces);
             verifier_context.used_nonces.get_mut(&key).unwrap()
         };
 
-        if used_nonces.contains(&Some(nonce.clone())) {
+        if used_nonces.nonces.contains(&Some(nonce.clone())) {
             return false;
         }
-        used_nonces[verifier_context.buffer_pos] = Some(nonce.clone());
-        verifier_context.buffer_pos =
-            verifier_context.buffer_pos + 1 % ValidNonceContext::BUFFER_SIZE;
+        used_nonces.nonces[used_nonces.buffer_pos] = Some(nonce.clone());
+        used_nonces.buffer_pos = used_nonces.buffer_pos + 1 % ValidNonceContext::BUFFER_SIZE;
         true
+    }
+}
+
+impl VerifierEx for RequireValidNonce {}
+
+#[derive(Debug, Clone, Copy, Hash, Constructor, Default)]
+pub struct RequireValidTime;
+
+struct ValidTimeContext {
+    last_seen: HashMap<(u64, Option<KeyLocatorData>), u64>,
+}
+
+impl ValidTimeContext {
+    const GRACE_PERIOD: u64 = 60_000;
+}
+
+#[async_trait]
+impl InterestVerifier for RequireValidTime {
+    async fn verify(&self, interest: &Interest<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
+        let Some(signature_info) = interest.signature_info() else {
+            // Unsigned - might be allowed
+            return true;
+        };
+
+        let Some(timestamp) = signature_info.time() else {
+            // No timestamp present
+            return false;
+        };
+
+        let key = (
+            signature_info.signature_type().value(),
+            signature_info.key_locator().map(Clone::clone),
+        );
+
+        let mut context = context.write().await;
+        let verifier_context = {
+            if !context.contains::<ValidTimeContext>() {
+                let verifier_context = ValidTimeContext {
+                    last_seen: HashMap::new(),
+                };
+                context.insert(verifier_context);
+            }
+            context.get_mut::<ValidTimeContext>().unwrap()
+        };
+
+        if !verifier_context.last_seen.contains_key(&key) {
+            verifier_context.last_seen.insert(
+                key.clone(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+                    - ValidTimeContext::GRACE_PERIOD,
+            );
+        }
+        let last_seen = verifier_context.last_seen.get_mut(&key).unwrap();
+        if timestamp.as_u64() > *last_seen {
+            *last_seen = timestamp.as_u64();
+            return true;
+        }
+        false
     }
 }
