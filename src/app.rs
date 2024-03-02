@@ -73,11 +73,15 @@ pub struct RouteHandler<Context> {
     verifier: Box<dyn InterestVerifier + Send + Sync>,
 }
 
-pub struct App<S, Context, Routes> {
+type InitialisedRoutes<Context> = Arc<RwLock<BTreeMap<Name, RouteHandler<Context>>>>;
+#[doc(hidden)]
+pub type UninitialisedRoutes<Context> = BTreeMap<Name, RouteHandler<Context>>;
+
+pub struct App<Signer, Context, Routes> {
     routes: Routes,
     on_start: Option<Box<dyn OnStartFn<Context>>>,
     connector: Connector,
-    signer: Arc<RwLock<S>>,
+    signer: Arc<RwLock<Signer>>,
     verifier_context: Arc<RwLock<TypeMap>>,
     context: Context,
 }
@@ -148,12 +152,12 @@ impl AppHandler {
     }
 }
 
-impl<S, Context> App<S, Context, BTreeMap<Name, RouteHandler<Context>>>
+impl<Signer, Context> App<Signer, Context, UninitialisedRoutes<Context>>
 where
-    S: SignMethod + Send + Sync + 'static,
+    Signer: SignMethod + Send + Sync + 'static,
     Context: Clone + Send + 'static,
 {
-    pub fn new(signer: S, context: Context) -> Self {
+    pub fn new(signer: Signer, context: Context) -> Self {
         Self {
             routes: BTreeMap::new(),
             connector: Connector::Unix("/var/run/nfd/nfd.sock".to_string()),
@@ -165,10 +169,15 @@ where
     }
 
     #[allow(private_bounds)]
-    pub fn route<CB, Ver>(mut self, name: impl ToName, verifier: Ver, func: CB) -> Self
+    pub fn route<Callback, Verifier>(
+        mut self,
+        name: impl ToName,
+        verifier: Verifier,
+        func: Callback,
+    ) -> Self
     where
-        CB: InterestCallback<Context> + Send + Sync + 'static,
-        Ver: InterestVerifier + Send + Sync + 'static,
+        Callback: InterestCallback<Context> + Send + Sync + 'static,
+        Verifier: InterestVerifier + Send + Sync + 'static,
     {
         self.routes.insert(
             name.to_name(),
@@ -193,7 +202,7 @@ where
         self.initialise().start().await
     }
 
-    fn initialise(self) -> App<S, Context, Arc<RwLock<BTreeMap<Name, RouteHandler<Context>>>>> {
+    fn initialise(self) -> App<Signer, Context, InitialisedRoutes<Context>> {
         App {
             routes: Arc::new(RwLock::new(self.routes)),
             on_start: self.on_start,
@@ -205,9 +214,9 @@ where
     }
 }
 
-impl<S, Context> App<S, Context, Arc<RwLock<BTreeMap<Name, RouteHandler<Context>>>>>
+impl<Signer, Context> App<Signer, Context, InitialisedRoutes<Context>>
 where
-    S: SignMethod + Send + Sync + 'static,
+    Signer: SignMethod + Send + Sync + 'static,
     Context: Clone + Send + 'static,
 {
     async fn handle_interest(
@@ -215,7 +224,7 @@ where
         routes: Arc<RwLock<BTreeMap<Name, RouteHandler<Context>>>>,
         verifier_context: Arc<RwLock<TypeMap>>,
         app_handler: AppHandler,
-        signer: Arc<RwLock<S>>,
+        signer: Arc<RwLock<Signer>>,
         out_sender: mpsc::Sender<Packet>,
         context: Context,
     ) -> Result<()> {
