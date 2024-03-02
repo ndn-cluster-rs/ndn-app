@@ -313,7 +313,7 @@ impl InterestVerifier for RequireValidTime {
             return true;
         };
 
-        let Some(timestamp) = signature_info.time() else {
+        let Some(timestamp) = signature_info.time().map(|x| x.as_u64()) else {
             // No timestamp present
             return false;
         };
@@ -345,8 +345,57 @@ impl InterestVerifier for RequireValidTime {
             );
         }
         let last_seen = verifier_context.last_seen.get_mut(&key).unwrap();
-        if timestamp.as_u64() > *last_seen {
-            *last_seen = timestamp.as_u64();
+        if timestamp > *last_seen {
+            *last_seen = timestamp;
+            return true;
+        }
+        false
+    }
+}
+
+#[derive(Debug, Clone, Copy, Hash, Constructor, Default)]
+pub struct RequireValidSeqNum;
+
+struct ValidSeqNumContext {
+    last_seq_num: HashMap<(u64, Option<KeyLocatorData>), u64>,
+}
+
+#[async_trait]
+impl InterestVerifier for RequireValidSeqNum {
+    async fn verify(&self, interest: &Interest<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
+        let Some(signature_info) = interest.signature_info() else {
+            // Unsigned - might be allowed
+            return true;
+        };
+
+        let Some(seq_num) = signature_info.seq_num().map(|x| x.as_u64()) else {
+            // No timestamp present
+            return false;
+        };
+
+        let key = (
+            signature_info.signature_type().value(),
+            signature_info.key_locator().map(Clone::clone),
+        );
+
+        let mut context = context.write().await;
+        let verifier_context = {
+            if !context.contains::<ValidSeqNumContext>() {
+                let verifier_context = ValidSeqNumContext {
+                    last_seq_num: HashMap::new(),
+                };
+                context.insert(verifier_context);
+            }
+            context.get_mut::<ValidSeqNumContext>().unwrap()
+        };
+
+        if !verifier_context.last_seq_num.contains_key(&key) {
+            verifier_context.last_seq_num.insert(key.clone(), seq_num);
+            return true;
+        }
+        let last_seq_num = verifier_context.last_seq_num.get_mut(&key).unwrap();
+        if seq_num > *last_seq_num {
+            *last_seq_num = seq_num;
             return true;
         }
         false

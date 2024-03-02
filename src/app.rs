@@ -262,7 +262,6 @@ where
                                     .await
                                 {
                                     info!("Verification failed for request for {interest_uri}");
-                                    trace!("{:#?}", interest);
                                     continue;
                                 }
                                 if let Some(mut ret) = route_handler
