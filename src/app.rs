@@ -26,19 +26,19 @@ trait InterestCallback {
         &self,
         handler: AppHandler,
         interest: Interest<Bytes>,
-    ) -> Pin<Box<dyn Future<Output = Option<Data<Bytes>>> + 'static>>;
+    ) -> Pin<Box<dyn Future<Output = Option<Data<Bytes>>> + Send + 'static>>;
 }
 
 impl<F, G> InterestCallback for F
 where
     F: Fn(AppHandler, Interest<Bytes>) -> G,
-    G: Future<Output = Option<Data<Bytes>>> + 'static,
+    G: Future<Output = Option<Data<Bytes>>> + Send + 'static,
 {
     fn run(
         &self,
         handler: AppHandler,
         interest: Interest<Bytes>,
-    ) -> Pin<Box<(dyn Future<Output = Option<Data<Bytes>>>)>> {
+    ) -> Pin<Box<(dyn Future<Output = Option<Data<Bytes>>> + Send)>> {
         Box::pin(self(handler, interest))
     }
 }
@@ -58,13 +58,13 @@ where
     }
 }
 
-struct RouteHandler {
-    callback: Box<dyn InterestCallback>,
-    verifier: Box<dyn InterestVerifier>,
+pub struct RouteHandler {
+    callback: Box<dyn InterestCallback + Send + Sync>,
+    verifier: Box<dyn InterestVerifier + Send + Sync>,
 }
 
-pub struct App<S> {
-    routes: BTreeMap<Name, RouteHandler>,
+pub struct App<S, Routes> {
+    routes: Routes,
     on_start: Option<Box<dyn OnStartFn>>,
     connector: Connector,
     signer: Arc<RwLock<S>>,
@@ -137,11 +137,11 @@ impl AppHandler {
     }
 }
 
-impl<S> App<S>
+impl<S> App<S, BTreeMap<Name, RouteHandler>>
 where
     S: SignMethod + Send + Sync + 'static,
 {
-    pub fn new(signer: S) -> App<S> {
+    pub fn new(signer: S) -> Self {
         Self {
             routes: BTreeMap::new(),
             connector: Connector::Unix("/var/run/nfd/nfd.sock".to_string()),
@@ -152,10 +152,10 @@ where
     }
 
     #[allow(private_bounds)]
-    pub fn route<CB, Ver>(&mut self, name: impl ToName, verifier: Ver, func: CB) -> &mut Self
+    pub fn route<CB, Ver>(mut self, name: impl ToName, verifier: Ver, func: CB) -> Self
     where
-        CB: InterestCallback + 'static,
-        Ver: InterestVerifier + 'static,
+        CB: InterestCallback + Send + Sync + 'static,
+        Ver: InterestVerifier + Send + Sync + 'static,
     {
         self.routes.insert(
             name.to_name(),
@@ -168,7 +168,7 @@ where
     }
 
     #[allow(private_bounds)]
-    pub fn on_start<F>(&mut self, on_start: F) -> &mut Self
+    pub fn on_start<F>(mut self, on_start: F) -> Self
     where
         F: OnStartFn + 'static,
     {
@@ -176,7 +176,79 @@ where
         self
     }
 
-    pub async fn start(&mut self) -> Result<()> {
+    pub async fn start(self) -> Result<()> {
+        self.initialise().start().await
+    }
+
+    fn initialise(self) -> App<S, Arc<RwLock<BTreeMap<Name, RouteHandler>>>> {
+        App {
+            routes: Arc::new(RwLock::new(self.routes)),
+            on_start: self.on_start,
+            connector: self.connector,
+            signer: self.signer,
+            verifier_context: self.verifier_context,
+        }
+    }
+}
+
+impl<S> App<S, Arc<RwLock<BTreeMap<Name, RouteHandler>>>>
+where
+    S: SignMethod + Send + Sync + 'static,
+{
+    async fn handle_interest(
+        interest: Interest<Bytes>,
+        routes: Arc<RwLock<BTreeMap<Name, RouteHandler>>>,
+        verifier_context: Arc<RwLock<TypeMap>>,
+        app_handler: AppHandler,
+        signer: Arc<RwLock<S>>,
+        out_sender: mpsc::Sender<Packet>,
+    ) -> Result<()> {
+        let routes = routes.read().await;
+        let interest_uri = interest.name().to_uri();
+        info!("Received interest for {interest_uri}");
+        let mut matching_route_found = false;
+        for (route, route_handler) in routes.iter().rev() {
+            trace!("Checking against route {}", route.to_uri());
+            if interest.name().has_prefix(route) {
+                matching_route_found = true;
+                if !route_handler
+                    .verifier
+                    .verify(&interest, Arc::clone(&verifier_context))
+                    .await
+                {
+                    info!("Verification failed for request for {interest_uri}");
+                    continue;
+                }
+                if let Some(mut ret) = route_handler
+                    .callback
+                    .run(app_handler.clone(), interest.clone()) // TODO
+                    .await
+                {
+                    if !ret.is_signed() {
+                        let mut signer = signer.write().await;
+                        ret.sign(&mut *signer);
+                    }
+                    out_sender
+                        .send(Packet::Data(ret))
+                        .await
+                        .map_err(|_| Error::ConnectionClosed)?;
+                } else {
+                    let nack = Packet::make_nack(interest);
+                    out_sender
+                        .send(nack)
+                        .await
+                        .map_err(|_| Error::ConnectionClosed)?;
+                }
+                break;
+            }
+        }
+        if !matching_route_found {
+            debug!("Interest for {interest_uri} matches no routes");
+        }
+        Ok(())
+    }
+
+    pub async fn start(mut self) -> Result<()> {
         let (reader, writer): (
             Box<dyn AsyncRead + Unpin + Send>,
             Box<dyn AsyncWrite + Unpin + Send>,
@@ -202,17 +274,20 @@ where
         tokio::spawn(read_thread(reader, in_sender.clone()));
 
         let mut tasks = JoinSet::new();
-        self.routes.iter().for_each(|(route, _)| {
-            tasks.spawn(tokio::time::timeout(
-                Duration::from_secs(3),
-                register_route(
-                    Arc::clone(&self.signer),
-                    in_sender.subscribe(),
-                    out_sender.clone(),
-                    route.clone(),
-                ),
-            ));
-        });
+        {
+            let routes = self.routes.read().await;
+            routes.iter().for_each(|(route, _)| {
+                tasks.spawn(tokio::time::timeout(
+                    Duration::from_secs(3),
+                    register_route(
+                        Arc::clone(&self.signer),
+                        in_sender.subscribe(),
+                        out_sender.clone(),
+                        route.clone(),
+                    ),
+                ));
+            });
+        }
         while let Some(res) = tasks.join_next().await {
             match res {
                 Ok(Ok(Ok(()))) => (),
@@ -249,47 +324,14 @@ where
             match in_receiver.recv().await {
                 Ok(packet) => {
                     if let Packet::Interest(interest) = packet {
-                        let interest_uri = interest.name().to_uri();
-                        info!("Received interest for {interest_uri}");
-                        let mut matching_route_found = false;
-                        for (route, route_handler) in self.routes.iter().rev() {
-                            trace!("Checking against route {}", route.to_uri());
-                            if interest.name().has_prefix(route) {
-                                matching_route_found = true;
-                                if !route_handler
-                                    .verifier
-                                    .verify(&interest, Arc::clone(&self.verifier_context))
-                                    .await
-                                {
-                                    info!("Verification failed for request for {interest_uri}");
-                                    continue;
-                                }
-                                if let Some(mut ret) = route_handler
-                                    .callback
-                                    .run(app_handler.clone(), interest.clone())
-                                    .await
-                                {
-                                    if !ret.is_signed() {
-                                        let mut signer = self.signer.write().await;
-                                        ret.sign(&mut *signer);
-                                    }
-                                    out_sender
-                                        .send(Packet::Data(ret))
-                                        .await
-                                        .map_err(|_| Error::ConnectionClosed)?;
-                                } else {
-                                    let nack = Packet::make_nack(interest);
-                                    out_sender
-                                        .send(nack)
-                                        .await
-                                        .map_err(|_| Error::ConnectionClosed)?;
-                                }
-                                break;
-                            }
-                        }
-                        if !matching_route_found {
-                            debug!("Interest for {interest_uri} matches no routes");
-                        }
+                        tokio::spawn(Self::handle_interest(
+                            interest.clone(),
+                            Arc::clone(&self.routes),
+                            Arc::clone(&self.verifier_context),
+                            app_handler.clone(),
+                            Arc::clone(&self.signer),
+                            out_sender.clone(),
+                        ));
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => return Err(Error::ConnectionClosed),
