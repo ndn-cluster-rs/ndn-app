@@ -14,7 +14,7 @@ use tokio::{
 };
 use type_map::concurrent::TypeMap;
 
-use crate::{error::Error, verifier::InterestVerifier, DataExt, Result};
+use crate::{error::Error, verifier::InterestVerifier, DataExt, Result, ToName};
 
 #[derive(Debug, Clone)]
 enum Connector {
@@ -152,13 +152,13 @@ where
     }
 
     #[allow(private_bounds)]
-    pub fn route<CB, Ver>(&mut self, name: Name, verifier: Ver, func: CB) -> &mut Self
+    pub fn route<CB, Ver>(&mut self, name: impl ToName, verifier: Ver, func: CB) -> &mut Self
     where
         CB: InterestCallback + 'static,
         Ver: InterestVerifier + 'static,
     {
         self.routes.insert(
-            name,
+            name.to_name(),
             RouteHandler {
                 callback: Box::new(func),
                 verifier: Box::new(verifier),
@@ -262,6 +262,7 @@ where
                                     .await
                                 {
                                     info!("Verification failed for request for {interest_uri}");
+                                    trace!("{:#?}", interest);
                                     continue;
                                 }
                                 if let Some(mut ret) = route_handler

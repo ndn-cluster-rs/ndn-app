@@ -2,7 +2,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use error::Error;
 use log::warn;
 use ndn_ndnlp::{LpPacket, Packet};
-use ndn_protocol::{Data, Interest};
+use ndn_protocol::{Data, Interest, Name};
 use ndn_tlv::{Tlv, TlvDecode, TlvEncode, VarNum};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -11,6 +11,22 @@ pub mod error;
 pub mod verifier;
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+trait ToName {
+    fn to_name(self) -> Name;
+}
+
+impl ToName for &str {
+    fn to_name(self) -> Name {
+        Name::from_str(self).unwrap()
+    }
+}
+
+impl ToName for Name {
+    fn to_name(self) -> Name {
+        self
+    }
+}
 
 trait DataExt: Sized {
     async fn from_async_reader(reader: impl AsyncRead + Unpin) -> Option<Self>;

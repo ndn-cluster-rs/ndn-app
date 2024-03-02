@@ -8,13 +8,14 @@ edition = "2021"
 [dependencies]
 async-trait = "0.1.77"
 bytes = "1.5.0"
+derive_more = "0.99.17"
 log = "0.4.20"
 ndn-ndnlp = { version = "0.1.0", path = "../ndn-ndnlp" }
 ndn-nfd-mgmt = { version = "0.1.0", path = "../ndn-nfd-mgmt" }
 ndn-protocol = { version = "0.3.0", path = "../ndn-protocol" }
 ndn-tlv = { version = "0.3.0", path = "../ndn-tlv" }
 thiserror = "1.0.57"
-tokio = { version = "1.36.0", features = ["net", "sync", "io-util"] }
+tokio = { version = "1.36.0", features = ["net", "sync", "io-util", "time", "rt"] }
 type-map = "0.5.0"
 
 [dev-dependencies]
