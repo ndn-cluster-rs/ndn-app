@@ -1,5 +1,8 @@
-use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap, future::Future, marker::PhantomData, pin::Pin, sync::Arc, time::Duration,
+};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use log::{debug, error, info, trace, warn};
 use ndn_ndnlp::Packet;
@@ -21,27 +24,94 @@ enum Connector {
     Unix(String),
 }
 
-trait InterestCallback<Context> {
-    fn run(
+#[async_trait]
+trait InterestCallbackErased<Context> {
+    async fn run(
         &self,
         handler: AppHandler,
         interest: Interest<Bytes>,
         context: Context,
-    ) -> Pin<Box<dyn Future<Output = Option<Data<Bytes>>> + Send + 'static>>;
+    ) -> Option<Data<Bytes>>;
 }
 
-impl<F, G, Context> InterestCallback<Context> for F
+#[async_trait]
+impl<Context, Params, Output, T> InterestCallbackErased<Context> for T
 where
-    F: Fn(AppHandler, Interest<Bytes>, Context) -> G,
-    G: Future<Output = Option<Data<Bytes>>> + Send + 'static,
+    Self: Sync,
+    T: InterestCallback<Context, Params = Params, Output = Output>,
+    Context: Send + 'static,
+    Params: TlvDecode,
+    Output: TlvEncode,
 {
-    fn run(
+    async fn run(
         &self,
         handler: AppHandler,
         interest: Interest<Bytes>,
         context: Context,
-    ) -> Pin<Box<(dyn Future<Output = Option<Data<Bytes>>> + Send)>> {
-        Box::pin(self(handler, interest, context))
+    ) -> Option<Data<Bytes>> {
+        InterestCallback::run(
+            self,
+            handler,
+            interest.application_parameters_decode(),
+            context,
+        )
+        .await
+        .map(|x| x.content_encode())
+    }
+}
+
+struct InterestCallbackFunction<Input, Context, F> {
+    f: F,
+    _input: PhantomData<fn() -> Input>,
+    _context: PhantomData<fn() -> Context>,
+}
+
+trait IntoInterestCallbackFunction<Input, Context>: Sized {
+    fn into_interest_callback_function(self) -> InterestCallbackFunction<Input, Context, Self> {
+        InterestCallbackFunction {
+            f: self,
+            _input: PhantomData,
+            _context: PhantomData,
+        }
+    }
+}
+
+impl<F, G, Params, Context, Output> IntoInterestCallbackFunction<Params, Context> for F
+where
+    F: Fn(AppHandler, Interest<Params>, Context) -> G,
+    G: Future<Output = Option<Data<Output>>> + Send + 'static,
+{
+}
+
+trait InterestCallback<Context> {
+    type Params;
+    type Output;
+    fn run(
+        &self,
+        handler: AppHandler,
+        interest: Interest<Self::Params>,
+        context: Context,
+    ) -> Pin<Box<dyn Future<Output = Option<Data<Self::Output>>> + Send + 'static>>;
+}
+
+impl<F, G, Context, Params, Output> InterestCallback<Context>
+    for InterestCallbackFunction<Params, Context, F>
+where
+    Params: TlvDecode,
+    Output: TlvEncode,
+    F: Fn(AppHandler, Interest<Params>, Context) -> G,
+    G: Future<Output = Option<Data<Output>>> + Send + 'static,
+{
+    type Params = Params;
+    type Output = Output;
+
+    fn run(
+        &self,
+        handler: AppHandler,
+        interest: Interest<Self::Params>,
+        context: Context,
+    ) -> Pin<Box<(dyn Future<Output = Option<Data<Self::Output>>> + Send)>> {
+        Box::pin((self.f)(handler, interest, context))
     }
 }
 
@@ -69,7 +139,7 @@ where
 }
 
 pub struct RouteHandler<Context> {
-    callback: Box<dyn InterestCallback<Context> + Send + Sync>,
+    callback: Box<dyn InterestCallbackErased<Context> + Send + Sync>,
     verifier: Box<dyn InterestVerifier + Send + Sync>,
 }
 
@@ -169,20 +239,24 @@ where
     }
 
     #[allow(private_bounds)]
-    pub fn route<Callback, Verifier>(
+    pub fn route<Callback, Verifier, Params, Output, G>(
         mut self,
         name: impl ToName,
         verifier: Verifier,
         func: Callback,
     ) -> Self
     where
-        Callback: InterestCallback<Context> + Send + Sync + 'static,
+        Callback: IntoInterestCallbackFunction<Params, Context> + Send + Sync + 'static,
+        Callback: Fn(AppHandler, Interest<Params>, Context) -> G,
+        G: Future<Output = Option<Data<Output>>> + Send + 'static,
         Verifier: InterestVerifier + Send + Sync + 'static,
+        Params: TlvDecode + 'static,
+        Output: TlvEncode + 'static,
     {
         self.routes.insert(
             name.to_name(),
             RouteHandler {
-                callback: Box::new(func),
+                callback: Box::new(func.into_interest_callback_function()),
                 verifier: Box::new(verifier),
             },
         );
