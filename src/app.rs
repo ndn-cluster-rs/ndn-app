@@ -31,7 +31,7 @@ trait InterestCallbackErased<Context> {
         handler: AppHandler,
         interest: Interest<Bytes>,
         context: Context,
-    ) -> Option<Data<Bytes>>;
+    ) -> std::result::Result<Option<Data<Bytes>>, ()>;
 }
 
 #[async_trait]
@@ -40,7 +40,7 @@ where
     Self: Sync,
     T: InterestCallback<Context, Params = Params, Output = Output>,
     Context: Send + 'static,
-    Params: TlvDecode,
+    Params: TlvDecode + Send,
     Output: TlvEncode,
 {
     async fn run(
@@ -48,15 +48,17 @@ where
         handler: AppHandler,
         interest: Interest<Bytes>,
         context: Context,
-    ) -> Option<Data<Bytes>> {
-        InterestCallback::run(
-            self,
-            handler,
-            interest.application_parameters_decode(),
-            context,
+    ) -> std::result::Result<Option<Data<Bytes>>, ()> {
+        let has_params = interest.application_parameters().is_some();
+        let input_interest = interest.application_parameters_decode();
+        if has_params && input_interest.application_parameters().is_none() {
+            return Err(());
+        }
+        Ok(
+            InterestCallback::run(self, handler, input_interest, context)
+                .await
+                .map(|x| x.content_encode()),
         )
-        .await
-        .map(|x| x.content_encode())
     }
 }
 
@@ -169,11 +171,14 @@ pub struct AppHandler {
 }
 
 impl AppHandler {
-    pub async fn express_interest(
+    pub async fn express_interest<T>(
         &mut self,
-        interest: impl std::borrow::Borrow<Interest<Bytes>>,
-    ) -> Result<Data<Bytes>> {
-        let interest = interest.borrow();
+        interest: impl std::borrow::Borrow<Interest<T>>,
+    ) -> Result<Data<Bytes>>
+    where
+        T: TlvEncode + TlvDecode + Clone,
+    {
+        let interest = interest.borrow().clone().encode_application_parameters();
         let (notifier_sender, notifier_receiver) = sync::oneshot::channel();
         self.interest_sender
             .send(InterestToSend {
@@ -250,7 +255,7 @@ where
         Callback: Fn(AppHandler, Interest<Params>, Context) -> G,
         G: Future<Output = Option<Data<Output>>> + Send + 'static,
         Verifier: InterestVerifier + Send + Sync + 'static,
-        Params: TlvDecode + 'static,
+        Params: TlvDecode + Send + 'static,
         Output: TlvEncode + 'static,
     {
         self.routes.insert(
@@ -318,27 +323,31 @@ where
                     info!("Verification failed for request for {interest_uri}");
                     continue;
                 }
-                if let Some(mut ret) = route_handler
+                if let Ok(ret) = route_handler
                     .callback
                     .run(app_handler.clone(), interest.clone(), context.clone()) // TODO
                     .await
                 {
-                    if !ret.is_signed() {
-                        let mut signer = signer.write().await;
-                        ret.sign(&mut *signer);
+                    if let Some(mut ret) = ret {
+                        if !ret.is_signed() {
+                            let mut signer = signer.write().await;
+                            ret.sign(&mut *signer);
+                        }
+                        out_sender
+                            .send(Packet::Data(ret))
+                            .await
+                            .map_err(|_| Error::ConnectionClosed)?;
+                    } else {
+                        let nack = Packet::make_nack(interest);
+                        out_sender
+                            .send(nack)
+                            .await
+                            .map_err(|_| Error::ConnectionClosed)?;
                     }
-                    out_sender
-                        .send(Packet::Data(ret))
-                        .await
-                        .map_err(|_| Error::ConnectionClosed)?;
+                    break;
                 } else {
-                    let nack = Packet::make_nack(interest);
-                    out_sender
-                        .send(nack)
-                        .await
-                        .map_err(|_| Error::ConnectionClosed)?;
+                    debug!("Interest application parameter decoding failed for {interest_uri}");
                 }
-                break;
             }
         }
         if !matching_route_found {
