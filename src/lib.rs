@@ -8,6 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub mod app;
 pub mod error;
+mod util;
 pub mod verifier;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -34,6 +35,8 @@ trait DataExt: Sized {
 
 impl DataExt for Packet {
     async fn from_async_reader(mut reader: impl AsyncRead + Unpin) -> Option<Self> {
+        const BUFFER_SIZE: usize = 1024;
+
         let mut header_buf = [0; 18];
         let bytes_read = reader.read(&mut header_buf).await.ok()?;
         let mut header_bytes = Bytes::copy_from_slice(&header_buf);
@@ -62,10 +65,13 @@ impl DataExt for Packet {
         bytes.put(&header_buf[0..bytes_read]);
 
         let mut left_to_read = total_len - bytes_read;
-        let mut buf = [0; 1024];
+        let mut buf = [0; BUFFER_SIZE];
         while left_to_read > 0 {
-            let bytes_read = reader.read(&mut buf[0..left_to_read]).await.ok()?;
-            bytes.put(&buf[..left_to_read]);
+            let bytes_read = reader
+                .read(&mut buf[0..left_to_read.min(BUFFER_SIZE)])
+                .await
+                .ok()?;
+            bytes.put(&buf[..left_to_read.min(BUFFER_SIZE)]);
             left_to_read -= bytes_read;
         }
 

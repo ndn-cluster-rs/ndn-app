@@ -1,23 +1,28 @@
 use std::{
-    collections::BTreeMap, future::Future, marker::PhantomData, pin::Pin, sync::Arc, time::Duration,
+    collections::{BTreeMap, HashMap},
+    future::Future,
+    marker::PhantomData,
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use log::{debug, error, info, trace, warn};
-use ndn_ndnlp::Packet;
+use ndn_ndnlp::{FragCount, FragIndex, Fragment, LpPacket, Packet, Sequence};
 use ndn_nfd_mgmt::{make_command, ControlParameters, ControlResponse};
 use ndn_protocol::{signature::SignMethod, Data, Interest, Name, SignSettings};
-use ndn_tlv::{TlvDecode, TlvEncode};
+use ndn_tlv::{NonNegativeInteger, TlvDecode, TlvEncode};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
-    net::UnixStream,
+    net::{UdpSocket, UnixStream},
     sync::{self, broadcast, mpsc, RwLock},
     task::JoinSet,
 };
 use type_map::concurrent::TypeMap;
 
-use crate::{error::Error, verifier::InterestVerifier, DataExt, Result, ToName};
+use crate::{error::Error, util::add_bytes, verifier::InterestVerifier, DataExt, Result, ToName};
 
 #[derive(Debug, Clone)]
 enum Connector {
@@ -156,6 +161,7 @@ pub struct App<Signer, Context, Routes> {
     signer: Arc<RwLock<Signer>>,
     verifier_context: Arc<RwLock<TypeMap>>,
     context: Context,
+    mtu: usize,
 }
 
 struct InterestToSend<T> {
@@ -240,6 +246,7 @@ where
             on_start: None,
             verifier_context: Arc::new(RwLock::new(TypeMap::new())),
             context,
+            mtu: 8800,
         }
     }
 
@@ -277,6 +284,11 @@ where
         self
     }
 
+    pub fn mtu(mut self, mtu: usize) -> Self {
+        self.mtu = mtu;
+        self
+    }
+
     pub async fn start(self) -> Result<()> {
         self.initialise().start().await
     }
@@ -289,6 +301,7 @@ where
             signer: self.signer,
             verifier_context: self.verifier_context,
             context: self.context,
+            mtu: self.mtu,
         }
     }
 }
@@ -378,7 +391,7 @@ where
         // Incoming data distribution
         let (in_sender, mut in_receiver) = broadcast::channel(128);
 
-        tokio::spawn(write_thread(writer, out_receiver));
+        tokio::spawn(write_thread(writer, out_receiver, self.mtu));
         tokio::spawn(read_thread(reader, in_sender.clone()));
 
         let mut tasks = JoinSet::new();
@@ -428,10 +441,14 @@ where
             tokio::spawn(on_start.run(app_handler.clone(), self.context.clone()));
         }
 
-        loop {
+        let mut partial_packet: Vec<Bytes> = Vec::new();
+        let mut partial_count = 0;
+        let mut last_seq = BytesMut::new();
+
+        'main_loop: loop {
             match in_receiver.recv().await {
-                Ok(packet) => {
-                    if let Packet::Interest(interest) = packet {
+                Ok(packet) => match packet {
+                    Packet::Interest(interest) => {
                         tokio::spawn(Self::handle_interest(
                             interest.clone(),
                             Arc::clone(&self.routes),
@@ -442,7 +459,69 @@ where
                             self.context.clone(),
                         ));
                     }
-                }
+                    Packet::LpPacket(packet) => {
+                        for header in packet.other_headers() {
+                            if header.is_critical() {
+                                // Unknown critical header - packet must be dropped
+                                continue 'main_loop;
+                            }
+                        }
+
+                        if let Some((frag_idx, frag_cnt)) = packet.frag_info() {
+                            // sequence number is required
+                            let (Some(seq), Some(fragment)) = (packet.seq_num(), packet.fragment())
+                            else {
+                                partial_packet.clear();
+                                partial_count = 0;
+                                continue 'main_loop;
+                            };
+
+                            // Wrong fragment index
+                            if frag_idx.as_usize() != partial_packet.len() {
+                                partial_packet.clear();
+                                partial_count = 0;
+                                continue 'main_loop;
+                            }
+                            // New fragment
+                            if frag_idx.as_usize() == 0 {
+                                partial_count = frag_cnt.into();
+                                partial_packet.clear();
+                                partial_packet.reserve(frag_cnt.as_usize());
+                                last_seq = BytesMut::from(&seq[..]);
+                            // Wrong total fragment number
+                            } else if partial_count != frag_cnt.as_u64() {
+                                partial_packet.clear();
+                                partial_count = 0;
+                                continue 'main_loop;
+                            } else {
+                                add_bytes(&mut last_seq, 1);
+                                // Sequence number not consecutive
+                                if last_seq != seq {
+                                    add_bytes(&mut last_seq, -1);
+                                    partial_packet.clear();
+                                    partial_count = 0;
+                                    continue 'main_loop;
+                                }
+                            }
+
+                            partial_packet.push(fragment);
+                            if frag_idx == frag_cnt {
+                                let total_size: usize = partial_packet.iter().map(Bytes::len).sum();
+                                let mut data = BytesMut::with_capacity(total_size);
+
+                                for fragment in &partial_packet {
+                                    data.put(fragment.clone());
+                                }
+                                partial_packet.clear();
+                                partial_count = 0;
+
+                                let packet = Packet::decode(&mut data.freeze());
+                                debug!("Reconstituted packet: {packet:#?}");
+                            }
+                        }
+                    }
+                    _ => {}
+                },
                 Err(broadcast::error::RecvError::Closed) => return Err(Error::ConnectionClosed),
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!("Dropped {n} packets in routing handler");
@@ -478,9 +557,43 @@ async fn interest_thread(
 async fn write_thread(
     mut writer: impl AsyncWrite + Unpin,
     mut receiver: mpsc::Receiver<Packet>,
+    mtu: usize,
 ) -> Result<()> {
+    let mut seq_num = BytesMut::from(&[0; 8][..]);
+
     while let Some(packet) = receiver.recv().await {
-        writer.write_all(&packet.encode()).await?;
+        let mut data = packet.encode();
+
+        if data.len() > mtu {
+            let header = LpPacket {
+                sequence: Some(Sequence(seq_num.clone().freeze())),
+                frag_index: Some(FragIndex(NonNegativeInteger::U64(0))),
+                frag_count: Some(FragCount(NonNegativeInteger::U64(0))),
+                nack: None,
+                other_headers: Vec::new(),
+                fragment: None,
+            };
+            let header_size = header.size();
+
+            let frag_count = data.len().div_ceil(mtu - header_size);
+
+            for i in 0..frag_count {
+                let frame = LpPacket {
+                    sequence: Some(Sequence(seq_num.clone().freeze())),
+                    frag_index: Some(FragIndex(NonNegativeInteger::new(i as u64))),
+                    frag_count: Some(FragCount(NonNegativeInteger::new(frag_count as u64))),
+                    nack: None,
+                    other_headers: Vec::new(),
+                    fragment: Some(Fragment {
+                        data: data.split_to(data.len().min(mtu - header_size)),
+                    }),
+                };
+                add_bytes(&mut seq_num, 1);
+                writer.write_all(&frame.encode()).await?;
+            }
+        } else {
+            writer.write_all(&data).await?;
+        }
         writer.flush().await?;
     }
     Err(Error::ConnectionClosed)
