@@ -3,12 +3,17 @@ use std::{collections::HashMap, sync::Arc};
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
 use derive_more::Constructor;
+use log::{debug, trace};
 use ndn_protocol::{
-    signature::{KeyLocatorData, SignMethod},
+    signature::{KeyLocatorData, SignMethod, SignatureVerifier},
     Data, DigestSha256, Interest,
 };
 use tokio::sync::RwLock;
 use type_map::concurrent::TypeMap;
+
+pub struct CertStore {
+    pub certs: HashMap<KeyLocatorData, Box<dyn SignatureVerifier + Send + Sync>>,
+}
 
 /// A simple verifier that will allow unsigned and signed interests, but will make sure a
 /// DigestSha256-signed interest has a valid digest
@@ -26,7 +31,12 @@ pub const SIMPLE_SIGNED: AndVerifier<
 
 #[async_trait]
 pub trait InterestVerifier {
-    async fn verify(&self, interest: &Interest<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool;
+    async fn verify(
+        &self,
+        interest: &Interest<Bytes>,
+        context: Arc<RwLock<TypeMap>>,
+        cert_store: Arc<RwLock<CertStore>>,
+    ) -> bool;
 }
 
 #[async_trait]
@@ -51,14 +61,19 @@ impl VerifierEx for AllowAll {}
 
 #[async_trait]
 impl DataVerifier for AllowAll {
-    async fn verify(&self, _data: &Data<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
+    async fn verify(&self, _data: &Data<Bytes>, _context: Arc<RwLock<TypeMap>>) -> bool {
         true
     }
 }
 
 #[async_trait]
 impl InterestVerifier for AllowAll {
-    async fn verify(&self, _data: &Interest<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
+    async fn verify(
+        &self,
+        _data: &Interest<Bytes>,
+        _context: Arc<RwLock<TypeMap>>,
+        _cert_store: Arc<RwLock<CertStore>>,
+    ) -> bool {
         true
     }
 }
@@ -68,14 +83,19 @@ pub struct ForbidAll;
 
 #[async_trait]
 impl DataVerifier for ForbidAll {
-    async fn verify(&self, _data: &Data<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
+    async fn verify(&self, _data: &Data<Bytes>, _context: Arc<RwLock<TypeMap>>) -> bool {
         false
     }
 }
 
 #[async_trait]
 impl InterestVerifier for ForbidAll {
-    async fn verify(&self, _data: &Interest<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
+    async fn verify(
+        &self,
+        _data: &Interest<Bytes>,
+        _context: Arc<RwLock<TypeMap>>,
+        _cert_store: Arc<RwLock<CertStore>>,
+    ) -> bool {
         false
     }
 }
@@ -104,9 +124,17 @@ where
     T: InterestVerifier + Sync,
     U: InterestVerifier + Sync,
 {
-    async fn verify(&self, interest: &Interest<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
-        let res1 = self.0.verify(interest, Arc::clone(&context)).await;
-        let res2 = self.1.verify(interest, context).await;
+    async fn verify(
+        &self,
+        interest: &Interest<Bytes>,
+        context: Arc<RwLock<TypeMap>>,
+        cert_store: Arc<RwLock<CertStore>>,
+    ) -> bool {
+        let res1 = self
+            .0
+            .verify(interest, Arc::clone(&context), Arc::clone(&cert_store))
+            .await;
+        let res2 = self.1.verify(interest, context, cert_store).await;
         res1 || res2
     }
 }
@@ -135,9 +163,17 @@ where
     T: InterestVerifier + Sync,
     U: InterestVerifier + Sync,
 {
-    async fn verify(&self, interest: &Interest<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
-        let res1 = self.0.verify(interest, Arc::clone(&context)).await;
-        let res2 = self.1.verify(interest, context).await;
+    async fn verify(
+        &self,
+        interest: &Interest<Bytes>,
+        context: Arc<RwLock<TypeMap>>,
+        cert_store: Arc<RwLock<CertStore>>,
+    ) -> bool {
+        let res1 = self
+            .0
+            .verify(interest, Arc::clone(&context), Arc::clone(&cert_store))
+            .await;
+        let res2 = self.1.verify(interest, context, cert_store).await;
         res1 && res2
     }
 }
@@ -145,41 +181,123 @@ where
 impl<T, U> VerifierEx for AndVerifier<T, U> {}
 
 #[derive(Debug, Clone, Copy, Hash, Default)]
-pub struct RequireValidSignature<Method: Send + Sync>(pub Method);
+pub struct RequireValidSignature<Method>(pub Method)
+where
+    Method: SignatureVerifier + Send + Sync;
 
 #[async_trait]
 impl<Method> InterestVerifier for RequireValidSignature<Method>
 where
-    Method: SignMethod + Send + Sync,
-    Method::Certificate: Clone,
+    Method: SignatureVerifier + Send + Sync,
 {
-    async fn verify(&self, interest: &Interest<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
-        interest
-            .verify_with_sign_method(&self.0, self.0.certificate().clone())
-            .is_ok()
+    async fn verify(
+        &self,
+        interest: &Interest<Bytes>,
+        _context: Arc<RwLock<TypeMap>>,
+        cert_store: Arc<RwLock<CertStore>>,
+    ) -> bool {
+        let verified = interest.verify_with_verifier(&self.0).is_ok();
+        if verified {
+            return true;
+        }
+
+        let Some(anchor_cert) = self.0.certificate() else {
+            return false;
+        };
+        trace!("Anchor: {}", anchor_cert.name().to_uri());
+
+        let Some(info) = interest.signature_info() else {
+            return false;
+        };
+        let Some(locator) = info.key_locator() else {
+            return false;
+        };
+
+        let mut certs_to_check = HashMap::new();
+        let mut next_cert = locator.clone();
+        let certs = cert_store.read().await;
+        loop {
+            if certs_to_check.contains_key(&next_cert) {
+                // Cycle in key chain
+                return false;
+            }
+            if next_cert
+                .as_name()
+                .is_some_and(|x| anchor_cert.name().has_prefix(x))
+            {
+                // Next cert is trust anchor
+                break;
+            }
+            let Some(cert) = certs.certs.get(&next_cert) else {
+                // Signed by unknown certificate
+                return false;
+            };
+
+            let Some(cur_cert) = cert.certificate() else {
+                return false;
+            };
+
+            let Some(cur_info) = cur_cert.signature_info() else {
+                return false;
+            };
+            certs_to_check.insert(next_cert, cert);
+            let Some(next_locator) = cur_info.key_locator() else {
+                return false;
+            };
+            next_cert = next_locator.locator().clone();
+        }
+
+        debug!("{:?}", certs_to_check.keys());
+
+        for (_, cert) in &certs_to_check {
+            let certificate = cert.certificate().unwrap();
+            let data = certificate.as_data();
+            let signature_info = data.signature_info().unwrap();
+            let locator = signature_info.key_locator().unwrap();
+
+            if let Some(signer) = certs_to_check.get(locator.locator()) {
+                if data.verify_with_sign_method(&***signer).is_err()
+                    && data.verify_with_sign_method(&self.0).is_err()
+                {
+                    trace!("a");
+                    return false;
+                }
+            } else {
+                if data.verify_with_sign_method(&self.0).is_err() {
+                    trace!("b");
+                    trace!("Failed to verify: {:#?}", data);
+                    return false;
+                }
+            }
+        }
+
+        true
     }
 }
 
 #[async_trait]
 impl<Method> DataVerifier for RequireValidSignature<Method>
 where
-    Method: SignMethod + Send + Sync,
-    Method::Certificate: Clone,
+    Method: SignatureVerifier + Send + Sync,
 {
-    async fn verify(&self, data: &Data<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
-        data.verify_with_sign_method(&self.0, self.0.certificate().clone())
-            .is_ok()
+    async fn verify(&self, data: &Data<Bytes>, _context: Arc<RwLock<TypeMap>>) -> bool {
+        data.verify_with_sign_method(&self.0).is_ok()
     }
 }
 
-impl<T: Send + Sync> VerifierEx for RequireValidSignature<T> {}
+impl<T: SignatureVerifier + Send + Sync> VerifierEx for RequireValidSignature<T> {}
 
 #[derive(Debug, Clone, Copy, Hash, Constructor, Default)]
 pub struct ForbidDigestSignature;
 
 #[async_trait]
 impl InterestVerifier for ForbidDigestSignature {
-    async fn verify(&self, interest: &Interest<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
+    async fn verify(
+        &self,
+        interest: &Interest<Bytes>,
+        _context: Arc<RwLock<TypeMap>>,
+        _cert_store: Arc<RwLock<CertStore>>,
+    ) -> bool {
         if let Some(info) = interest.signature_info() {
             info.signature_type().value() != ndn_protocol::DigestSha256::SIGNATURE_TYPE
         } else {
@@ -190,7 +308,7 @@ impl InterestVerifier for ForbidDigestSignature {
 
 #[async_trait]
 impl DataVerifier for ForbidDigestSignature {
-    async fn verify(&self, data: &Data<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
+    async fn verify(&self, data: &Data<Bytes>, _context: Arc<RwLock<TypeMap>>) -> bool {
         if let Some(info) = data.signature_info() {
             info.signature_type().value() != ndn_protocol::DigestSha256::SIGNATURE_TYPE
         } else {
@@ -206,14 +324,19 @@ pub struct ForbidUnsigned;
 
 #[async_trait]
 impl InterestVerifier for ForbidUnsigned {
-    async fn verify(&self, interest: &Interest<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
+    async fn verify(
+        &self,
+        interest: &Interest<Bytes>,
+        _context: Arc<RwLock<TypeMap>>,
+        _cert_store: Arc<RwLock<CertStore>>,
+    ) -> bool {
         interest.signature_info().is_some()
     }
 }
 
 #[async_trait]
 impl DataVerifier for ForbidUnsigned {
-    async fn verify(&self, data: &Data<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
+    async fn verify(&self, data: &Data<Bytes>, _context: Arc<RwLock<TypeMap>>) -> bool {
         data.signature_info().is_some()
     }
 }
@@ -238,7 +361,12 @@ impl ValidNonceContext {
 
 #[async_trait]
 impl InterestVerifier for RequireValidNonce {
-    async fn verify(&self, interest: &Interest<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
+    async fn verify(
+        &self,
+        interest: &Interest<Bytes>,
+        context: Arc<RwLock<TypeMap>>,
+        _cert_store: Arc<RwLock<CertStore>>,
+    ) -> bool {
         let Some(signature_info) = interest.signature_info() else {
             // Unsigned - might be allowed
             return true;
@@ -309,7 +437,12 @@ impl ValidTimeContext {
 
 #[async_trait]
 impl InterestVerifier for RequireValidTime {
-    async fn verify(&self, interest: &Interest<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
+    async fn verify(
+        &self,
+        interest: &Interest<Bytes>,
+        context: Arc<RwLock<TypeMap>>,
+        _cert_store: Arc<RwLock<CertStore>>,
+    ) -> bool {
         let Some(signature_info) = interest.signature_info() else {
             // Unsigned - might be allowed
             return true;
@@ -364,7 +497,12 @@ struct ValidSeqNumContext {
 
 #[async_trait]
 impl InterestVerifier for RequireValidSeqNum {
-    async fn verify(&self, interest: &Interest<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
+    async fn verify(
+        &self,
+        interest: &Interest<Bytes>,
+        context: Arc<RwLock<TypeMap>>,
+        _cert_store: Arc<RwLock<CertStore>>,
+    ) -> bool {
         let Some(signature_info) = interest.signature_info() else {
             // Unsigned - might be allowed
             return true;

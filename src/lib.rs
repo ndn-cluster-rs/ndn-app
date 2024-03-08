@@ -41,6 +41,11 @@ impl DataExt for Packet {
         let bytes_read = reader.read(&mut header_buf).await.ok()?;
         let mut header_bytes = Bytes::copy_from_slice(&header_buf);
 
+        if bytes_read == 0 {
+            log::error!("Socket closed");
+            return None;
+        }
+
         let typ = VarNum::decode(&mut header_bytes).ok()?;
         let len = VarNum::decode(&mut header_bytes).ok()?;
         if typ.value() as usize != Interest::<()>::TYP

@@ -12,17 +12,24 @@ use bytes::{BufMut, Bytes, BytesMut};
 use log::{debug, error, info, trace, warn};
 use ndn_ndnlp::{FragCount, FragIndex, Fragment, LpPacket, Packet, Sequence};
 use ndn_nfd_mgmt::{make_command, ControlParameters, ControlResponse};
-use ndn_protocol::{signature::SignMethod, Data, Interest, Name, SignSettings};
+use ndn_protocol::{
+    signature::{KeyLocatorData, SignMethod, SignatureVerifier},
+    Data, Interest, Name, SignSettings,
+};
 use ndn_tlv::{NonNegativeInteger, TlvDecode, TlvEncode};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
-    net::{UdpSocket, UnixStream},
+    net::UnixStream,
     sync::{self, broadcast, mpsc, RwLock},
-    task::JoinSet,
 };
 use type_map::concurrent::TypeMap;
 
-use crate::{error::Error, util::add_bytes, verifier::InterestVerifier, DataExt, Result, ToName};
+use crate::{
+    error::Error,
+    util::add_bytes,
+    verifier::{CertStore, InterestVerifier},
+    DataExt, Result, ToName,
+};
 
 #[derive(Debug, Clone)]
 enum Connector {
@@ -150,11 +157,17 @@ pub struct RouteHandler<Context> {
     verifier: Box<dyn InterestVerifier + Send + Sync>,
 }
 
-type InitialisedRoutes<Context> = Arc<RwLock<BTreeMap<Name, RouteHandler<Context>>>>;
-#[doc(hidden)]
-pub type UninitialisedRoutes<Context> = BTreeMap<Name, RouteHandler<Context>>;
+type InitialisedApp<Signer, Context> = App<
+    Signer,
+    Context,
+    Arc<RwLock<BTreeMap<Name, RouteHandler<Context>>>>,
+    Arc<RwLock<CertStore>>,
+>;
 
-pub struct App<Signer, Context, Routes> {
+type UninitialisedApp<Signer, Context> =
+    App<Signer, Context, BTreeMap<Name, RouteHandler<Context>>, CertStore>;
+
+pub struct App<Signer, Context, Routes, CS> {
     routes: Routes,
     on_start: Option<Box<dyn OnStartFn<Context>>>,
     connector: Connector,
@@ -162,6 +175,7 @@ pub struct App<Signer, Context, Routes> {
     verifier_context: Arc<RwLock<TypeMap>>,
     context: Context,
     mtu: usize,
+    cert_store: CS,
 }
 
 struct InterestToSend<T> {
@@ -233,7 +247,7 @@ impl AppHandler {
     }
 }
 
-impl<Signer, Context> App<Signer, Context, UninitialisedRoutes<Context>>
+impl<Signer, Context> UninitialisedApp<Signer, Context>
 where
     Signer: SignMethod + Send + Sync + 'static,
     Context: Clone + Send + 'static,
@@ -247,6 +261,9 @@ where
             verifier_context: Arc::new(RwLock::new(TypeMap::new())),
             context,
             mtu: 8800,
+            cert_store: CertStore {
+                certs: HashMap::new(),
+            },
         }
     }
 
@@ -293,7 +310,16 @@ where
         self.initialise().start().await
     }
 
-    fn initialise(self) -> App<Signer, Context, InitialisedRoutes<Context>> {
+    pub fn add_cert(
+        mut self,
+        locator: KeyLocatorData,
+        verifier: Box<dyn SignatureVerifier + Send + Sync>,
+    ) -> Self {
+        self.cert_store.certs.insert(locator, verifier);
+        self
+    }
+
+    fn initialise(self) -> InitialisedApp<Signer, Context> {
         App {
             routes: Arc::new(RwLock::new(self.routes)),
             on_start: self.on_start,
@@ -302,11 +328,12 @@ where
             verifier_context: self.verifier_context,
             context: self.context,
             mtu: self.mtu,
+            cert_store: Arc::new(RwLock::new(self.cert_store)),
         }
     }
 }
 
-impl<Signer, Context> App<Signer, Context, InitialisedRoutes<Context>>
+impl<Signer, Context> InitialisedApp<Signer, Context>
 where
     Signer: SignMethod + Send + Sync + 'static,
     Context: Clone + Send + 'static,
@@ -317,12 +344,13 @@ where
         verifier_context: Arc<RwLock<TypeMap>>,
         app_handler: AppHandler,
         signer: Arc<RwLock<Signer>>,
+        cert_store: Arc<RwLock<CertStore>>,
         out_sender: mpsc::Sender<Packet>,
         context: Context,
     ) -> Result<()> {
         let routes = routes.read().await;
         let interest_uri = interest.name().to_uri();
-        info!("Received interest for {interest_uri}");
+        trace!("Received interest for {interest_uri}");
         let mut matching_route_found = false;
         for (route, route_handler) in routes.iter().rev() {
             trace!("Checking against route {}", route.to_uri());
@@ -330,7 +358,11 @@ where
                 matching_route_found = true;
                 if !route_handler
                     .verifier
-                    .verify(&interest, Arc::clone(&verifier_context))
+                    .verify(
+                        &interest,
+                        Arc::clone(&verifier_context),
+                        Arc::clone(&cert_store),
+                    )
                     .await
                 {
                     info!("Verification failed for request for {interest_uri}");
@@ -394,32 +426,27 @@ where
         tokio::spawn(write_thread(writer, out_receiver, self.mtu));
         tokio::spawn(read_thread(reader, in_sender.clone()));
 
-        let mut tasks = JoinSet::new();
-        {
-            let routes = self.routes.read().await;
-            routes.iter().for_each(|(route, _)| {
-                tasks.spawn(tokio::time::timeout(
-                    Duration::from_secs(3),
-                    register_route(
-                        Arc::clone(&self.signer),
-                        in_sender.subscribe(),
-                        out_sender.clone(),
-                        route.clone(),
-                    ),
-                ));
-            });
-        }
-        while let Some(res) = tasks.join_next().await {
+        for (route, _) in self.routes.read().await.iter() {
+            let res = tokio::time::timeout(
+                Duration::from_secs(3),
+                register_route(
+                    Arc::clone(&self.signer),
+                    in_sender.subscribe(),
+                    out_sender.clone(),
+                    route.clone(),
+                ),
+            )
+            .await;
+
             match res {
-                Ok(Ok(Ok(()))) => (),
-                Ok(Ok(Err(x))) => return Err(x),
-                Ok(Err(_)) => {
+                Ok(Ok(())) => (),
+                Ok(Err(x)) => {
+                    error!("Route registration had an error: {}", x);
+                    return Err(x);
+                }
+                Err(_) => {
                     error!("Route registration timed out");
                     return Err(Error::Timeout);
-                }
-                Err(x) => {
-                    error!("Route registration panicked: {:?}", x.into_panic());
-                    return Err(Error::Other("panic".to_string()));
                 }
             }
         }
@@ -455,6 +482,7 @@ where
                             Arc::clone(&self.verifier_context),
                             app_handler.clone(),
                             Arc::clone(&self.signer),
+                            Arc::clone(&self.cert_store),
                             out_sender.clone(),
                             self.context.clone(),
                         ));
@@ -615,7 +643,7 @@ async fn register_route(
     sender: mpsc::Sender<Packet>,
     route: Name,
 ) -> Result<()> {
-    eprintln!("Registering route {route:?}");
+    info!("Registering route {}", route.to_uri());
     let control_parameters = ControlParameters::new().set_name(route.clone());
     let mut interest = make_command("rib", "register", control_parameters).unwrap();
 
@@ -645,8 +673,8 @@ async fn register_route(
                         } else {
                             info!("Registered route {route}", route = route.to_uri());
                         }
+                        return Ok(());
                     }
-                    return Ok(());
                 }
             }
             Ok(Packet::Interest(_)) => {}
