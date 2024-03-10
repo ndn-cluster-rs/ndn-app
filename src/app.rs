@@ -13,7 +13,7 @@ use log::{debug, error, info, trace, warn};
 use ndn_ndnlp::{FragCount, FragIndex, Fragment, LpPacket, Packet, Sequence};
 use ndn_nfd_mgmt::{make_command, ControlParameters, ControlResponse};
 use ndn_protocol::{
-    signature::{KeyLocatorData, SignMethod, SignatureVerifier},
+    signature::{KeyLocatorData, KnownVerifiers, SignMethod, SignatureVerifier, ToVerifier},
     Data, Interest, Name, SignSettings,
 };
 use ndn_tlv::{NonNegativeInteger, TlvDecode, TlvEncode};
@@ -157,17 +157,18 @@ pub struct RouteHandler<Context> {
     verifier: Box<dyn InterestVerifier + Send + Sync>,
 }
 
-type InitialisedApp<Signer, Context> = App<
+type InitialisedApp<Signer, Context, Verifiers> = App<
     Signer,
     Context,
+    Verifiers,
     Arc<RwLock<BTreeMap<Name, RouteHandler<Context>>>>,
     Arc<RwLock<CertStore>>,
 >;
 
-type UninitialisedApp<Signer, Context> =
-    App<Signer, Context, BTreeMap<Name, RouteHandler<Context>>, CertStore>;
+type UninitialisedApp<Signer, Context, Verifiers> =
+    App<Signer, Context, Verifiers, BTreeMap<Name, RouteHandler<Context>>, CertStore>;
 
-pub struct App<Signer, Context, Routes, CS> {
+pub struct App<Signer, Context, KnownVerifiers, Routes, CS> {
     routes: Routes,
     on_start: Option<Box<dyn OnStartFn<Context>>>,
     connector: Connector,
@@ -176,6 +177,7 @@ pub struct App<Signer, Context, Routes, CS> {
     context: Context,
     mtu: usize,
     cert_store: CS,
+    known_verifiers: Arc<KnownVerifiers>,
 }
 
 struct InterestToSend<T> {
@@ -198,12 +200,33 @@ impl AppHandler {
     where
         T: TlvEncode + TlvDecode + Clone,
     {
+        self.express_interest_impl(interest, true).await
+    }
+
+    pub async fn express_interest_unsigned<T>(
+        &mut self,
+        interest: impl std::borrow::Borrow<Interest<T>>,
+    ) -> Result<Data<Bytes>>
+    where
+        T: TlvEncode + TlvDecode + Clone,
+    {
+        self.express_interest_impl(interest, false).await
+    }
+
+    async fn express_interest_impl<T>(
+        &mut self,
+        interest: impl std::borrow::Borrow<Interest<T>>,
+        sign: bool,
+    ) -> Result<Data<Bytes>>
+    where
+        T: TlvEncode + TlvDecode + Clone,
+    {
         let interest = interest.borrow().clone().encode_application_parameters();
         let (notifier_sender, notifier_receiver) = sync::oneshot::channel();
         self.interest_sender
             .send(InterestToSend {
                 interest: interest.clone(),
-                sign: true,
+                sign,
                 notifier: notifier_sender,
             })
             .await
@@ -234,6 +257,10 @@ impl AppHandler {
                             };
 
                             if nack_interest.name() == &signed_name {
+                                debug!(
+                                    "Received NACK when requesting {}",
+                                    interest.name().to_uri()
+                                );
                                 return Err(Error::NackReceived);
                             }
                         }
@@ -243,11 +270,17 @@ impl AppHandler {
             }
             Err(Error::ConnectionClosed)
         };
-        tokio::time::timeout(Duration::from_millis(lifetime), wait_for_data).await?
+        match tokio::time::timeout(Duration::from_millis(lifetime), wait_for_data).await {
+            Ok(x) => x,
+            Err(x) => {
+                debug!("Request for {} timed out", interest.name().to_uri());
+                Err(x.into())
+            }
+        }
     }
 }
 
-impl<Signer, Context> UninitialisedApp<Signer, Context>
+impl<Signer, Context> UninitialisedApp<Signer, Context, KnownVerifiers>
 where
     Signer: SignMethod + Send + Sync + 'static,
     Context: Clone + Send + 'static,
@@ -264,9 +297,17 @@ where
             cert_store: CertStore {
                 certs: HashMap::new(),
             },
+            known_verifiers: Arc::new(KnownVerifiers),
         }
     }
+}
 
+impl<Signer, Context, Verifiers> UninitialisedApp<Signer, Context, Verifiers>
+where
+    Signer: SignMethod + Send + Sync + 'static,
+    Context: Clone + Send + 'static,
+    Verifiers: ToVerifier + Send + Sync + 'static,
+{
     #[allow(private_bounds)]
     pub fn route<Callback, Verifier, Params, Output, G>(
         mut self,
@@ -319,7 +360,7 @@ where
         self
     }
 
-    fn initialise(self) -> InitialisedApp<Signer, Context> {
+    fn initialise(self) -> InitialisedApp<Signer, Context, Verifiers> {
         App {
             routes: Arc::new(RwLock::new(self.routes)),
             on_start: self.on_start,
@@ -329,14 +370,16 @@ where
             context: self.context,
             mtu: self.mtu,
             cert_store: Arc::new(RwLock::new(self.cert_store)),
+            known_verifiers: self.known_verifiers,
         }
     }
 }
 
-impl<Signer, Context> InitialisedApp<Signer, Context>
+impl<Signer, Context, Verifiers> InitialisedApp<Signer, Context, Verifiers>
 where
     Signer: SignMethod + Send + Sync + 'static,
     Context: Clone + Send + 'static,
+    Verifiers: ToVerifier + Send + Sync + 'static,
 {
     async fn handle_interest(
         interest: Interest<Bytes>,
@@ -347,6 +390,7 @@ where
         cert_store: Arc<RwLock<CertStore>>,
         out_sender: mpsc::Sender<Packet>,
         context: Context,
+        known_verifiers: Arc<Verifiers>,
     ) -> Result<()> {
         let routes = routes.read().await;
         let interest_uri = interest.name().to_uri();
@@ -362,6 +406,8 @@ where
                         &interest,
                         Arc::clone(&verifier_context),
                         Arc::clone(&cert_store),
+                        app_handler.clone(),
+                        &*known_verifiers,
                     )
                     .await
                 {
@@ -485,6 +531,7 @@ where
                             Arc::clone(&self.cert_store),
                             out_sender.clone(),
                             self.context.clone(),
+                            Arc::clone(&self.known_verifiers),
                         ));
                     }
                     Packet::LpPacket(packet) => {

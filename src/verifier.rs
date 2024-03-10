@@ -3,13 +3,16 @@ use std::{collections::HashMap, sync::Arc};
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
 use derive_more::Constructor;
+use futures::{future::BoxFuture, FutureExt};
 use log::{debug, trace};
 use ndn_protocol::{
-    signature::{KeyLocatorData, SignMethod, SignatureVerifier},
-    Data, DigestSha256, Interest,
+    signature::{KeyLocatorData, SignMethod, SignatureVerifier, ToVerifier},
+    Certificate, Data, DigestSha256, Interest,
 };
 use tokio::sync::RwLock;
 use type_map::concurrent::TypeMap;
+
+use crate::app::AppHandler;
 
 pub struct CertStore {
     pub certs: HashMap<KeyLocatorData, Box<dyn SignatureVerifier + Send + Sync>>,
@@ -36,6 +39,8 @@ pub trait InterestVerifier {
         interest: &Interest<Bytes>,
         context: Arc<RwLock<TypeMap>>,
         cert_store: Arc<RwLock<CertStore>>,
+        app_handler: AppHandler,
+        signature_verifiers: &(dyn ToVerifier + Sync),
     ) -> bool;
 }
 
@@ -73,6 +78,8 @@ impl InterestVerifier for AllowAll {
         _data: &Interest<Bytes>,
         _context: Arc<RwLock<TypeMap>>,
         _cert_store: Arc<RwLock<CertStore>>,
+        _app_handler: AppHandler,
+        _signature_verifiers: &(dyn ToVerifier + Sync),
     ) -> bool {
         true
     }
@@ -95,6 +102,8 @@ impl InterestVerifier for ForbidAll {
         _data: &Interest<Bytes>,
         _context: Arc<RwLock<TypeMap>>,
         _cert_store: Arc<RwLock<CertStore>>,
+        _app_handler: AppHandler,
+        _signature_verifiers: &(dyn ToVerifier + Sync),
     ) -> bool {
         false
     }
@@ -129,12 +138,29 @@ where
         interest: &Interest<Bytes>,
         context: Arc<RwLock<TypeMap>>,
         cert_store: Arc<RwLock<CertStore>>,
+        app_handler: AppHandler,
+        signature_verifiers: &(dyn ToVerifier + Sync),
     ) -> bool {
         let res1 = self
             .0
-            .verify(interest, Arc::clone(&context), Arc::clone(&cert_store))
+            .verify(
+                interest,
+                Arc::clone(&context),
+                Arc::clone(&cert_store),
+                app_handler.clone(),
+                signature_verifiers,
+            )
             .await;
-        let res2 = self.1.verify(interest, context, cert_store).await;
+        let res2 = self
+            .1
+            .verify(
+                interest,
+                context,
+                cert_store,
+                app_handler,
+                signature_verifiers,
+            )
+            .await;
         res1 || res2
     }
 }
@@ -168,12 +194,29 @@ where
         interest: &Interest<Bytes>,
         context: Arc<RwLock<TypeMap>>,
         cert_store: Arc<RwLock<CertStore>>,
+        app_handler: AppHandler,
+        signature_verifiers: &(dyn ToVerifier + Sync),
     ) -> bool {
         let res1 = self
             .0
-            .verify(interest, Arc::clone(&context), Arc::clone(&cert_store))
+            .verify(
+                interest,
+                Arc::clone(&context),
+                Arc::clone(&cert_store),
+                app_handler.clone(),
+                signature_verifiers,
+            )
             .await;
-        let res2 = self.1.verify(interest, context, cert_store).await;
+        let res2 = self
+            .1
+            .verify(
+                interest,
+                context,
+                cert_store,
+                app_handler,
+                signature_verifiers,
+            )
+            .await;
         res1 && res2
     }
 }
@@ -185,6 +228,62 @@ pub struct RequireValidSignature<Method>(pub Method)
 where
     Method: SignatureVerifier + Send + Sync;
 
+impl<Method> RequireValidSignature<Method>
+where
+    Method: SignatureVerifier + Send + Sync,
+{
+    fn verify_signature<'a>(
+        &'a self,
+        cert: &'a Certificate,
+        mut app_handler: AppHandler,
+        signature_verifiers: &'a (dyn ToVerifier + Sync),
+    ) -> BoxFuture<'a, bool> {
+        async move {
+            let Some(anchor_cert) = self.0.certificate() else {
+                return false;
+            };
+
+            let Some(info) = cert.signature_info() else {
+                return false;
+            };
+
+            let Some(KeyLocatorData::Name(locator)) = info.key_locator().map(|x| x.locator())
+            else {
+                return false;
+            };
+
+            if anchor_cert.name().has_prefix(locator) {
+                // Signed by anchor
+                return cert.as_data().verify_with_sign_method(&self.0).is_ok();
+            }
+
+            let Ok(signer) = app_handler
+                .express_interest_unsigned(Interest::<()>::new(locator.clone()))
+                .await
+            else {
+                return false;
+            };
+            println!("{:#?}", signer);
+
+            let signer_cert = Certificate(signer);
+
+            if !self
+                .verify_signature(&signer_cert, app_handler.clone(), signature_verifiers)
+                .await
+            {
+                return false;
+            }
+
+            let Some(verifier) = signature_verifiers.from_data(signer_cert.0) else {
+                return false;
+            };
+
+            cert.as_data().verify_with_sign_method(&*verifier).is_ok()
+        }
+        .boxed()
+    }
+}
+
 #[async_trait]
 impl<Method> InterestVerifier for RequireValidSignature<Method>
 where
@@ -195,6 +294,8 @@ where
         interest: &Interest<Bytes>,
         _context: Arc<RwLock<TypeMap>>,
         cert_store: Arc<RwLock<CertStore>>,
+        mut app_handler: AppHandler,
+        signature_verifiers: &(dyn ToVerifier + Sync),
     ) -> bool {
         let verified = interest.verify_with_verifier(&self.0).is_ok();
         if verified {
@@ -213,9 +314,30 @@ where
             return false;
         };
 
+        /////////
+        let Some(locator_name) = locator.as_name() else {
+            return false;
+        };
+        debug!("Retrieving cert {}", locator_name.to_uri());
+        let Ok(signed_by) = app_handler
+            .express_interest_unsigned(Interest::<()>::new(locator_name.clone()))
+            .await
+        else {
+            return false;
+        };
+        println!("{:#?}", signed_by);
+        return self
+            .verify_signature(
+                &Certificate(signed_by),
+                app_handler.clone(),
+                signature_verifiers,
+            )
+            .await;
+        ////////
+
         let mut certs_to_check = HashMap::new();
         let mut next_cert = locator.clone();
-        let certs = cert_store.read().await;
+        let mut certs = cert_store.read().await;
         loop {
             if certs_to_check.contains_key(&next_cert) {
                 // Cycle in key chain
@@ -297,6 +419,8 @@ impl InterestVerifier for ForbidDigestSignature {
         interest: &Interest<Bytes>,
         _context: Arc<RwLock<TypeMap>>,
         _cert_store: Arc<RwLock<CertStore>>,
+        _app_handler: AppHandler,
+        _signature_verifiers: &(dyn ToVerifier + Sync),
     ) -> bool {
         if let Some(info) = interest.signature_info() {
             info.signature_type().value() != ndn_protocol::DigestSha256::SIGNATURE_TYPE
@@ -329,6 +453,8 @@ impl InterestVerifier for ForbidUnsigned {
         interest: &Interest<Bytes>,
         _context: Arc<RwLock<TypeMap>>,
         _cert_store: Arc<RwLock<CertStore>>,
+        _app_handler: AppHandler,
+        _signature_verifiers: &(dyn ToVerifier + Sync),
     ) -> bool {
         interest.signature_info().is_some()
     }
@@ -366,6 +492,8 @@ impl InterestVerifier for RequireValidNonce {
         interest: &Interest<Bytes>,
         context: Arc<RwLock<TypeMap>>,
         _cert_store: Arc<RwLock<CertStore>>,
+        _app_handler: AppHandler,
+        _signature_verifiers: &(dyn ToVerifier + Sync),
     ) -> bool {
         let Some(signature_info) = interest.signature_info() else {
             // Unsigned - might be allowed
@@ -442,6 +570,8 @@ impl InterestVerifier for RequireValidTime {
         interest: &Interest<Bytes>,
         context: Arc<RwLock<TypeMap>>,
         _cert_store: Arc<RwLock<CertStore>>,
+        _app_handler: AppHandler,
+        _signature_verifiers: &(dyn ToVerifier + Sync),
     ) -> bool {
         let Some(signature_info) = interest.signature_info() else {
             // Unsigned - might be allowed
@@ -502,6 +632,8 @@ impl InterestVerifier for RequireValidSeqNum {
         interest: &Interest<Bytes>,
         context: Arc<RwLock<TypeMap>>,
         _cert_store: Arc<RwLock<CertStore>>,
+        _app_handler: AppHandler,
+        _signature_verifiers: &(dyn ToVerifier + Sync),
     ) -> bool {
         let Some(signature_info) = interest.signature_info() else {
             // Unsigned - might be allowed

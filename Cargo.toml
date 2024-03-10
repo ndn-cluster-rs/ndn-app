@@ -9,6 +9,7 @@ edition = "2021"
 async-trait = "0.1.77"
 bytes = "1.5.0"
 derive_more = "0.99.17"
+futures = "0.3.30"
 log = "0.4.20"
 ndn-ndnlp = { version = "0.1.0", path = "../ndn-ndnlp" }
 ndn-nfd-mgmt = { version = "0.1.0", path = "../ndn-nfd-mgmt" }
