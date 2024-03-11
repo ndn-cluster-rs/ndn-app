@@ -213,8 +213,13 @@ where
         cert: &'a Certificate,
         mut app_handler: AppHandler,
         signature_verifiers: &'a (dyn ToVerifier + Sync),
+        max_depth: usize,
     ) -> BoxFuture<'a, bool> {
         async move {
+            if max_depth == 0 {
+                return false;
+            }
+
             let Some(anchor_cert) = self.0.certificate() else {
                 return false;
             };
@@ -247,7 +252,12 @@ where
             let signer_cert = Certificate(signer);
 
             if !self
-                .verify_signature(&signer_cert, app_handler.clone(), signature_verifiers)
+                .verify_signature(
+                    &signer_cert,
+                    app_handler.clone(),
+                    signature_verifiers,
+                    max_depth - 1,
+                )
                 .await
             {
                 return false;
@@ -275,6 +285,8 @@ where
         mut app_handler: AppHandler,
         signature_verifiers: &(dyn ToVerifier + Sync),
     ) -> bool {
+        const CERT_CHAIN_MAX_DEPTH: usize = 16;
+
         let verified = interest.verify_with_verifier(&self.0).is_ok();
         if verified {
             return true;
@@ -304,6 +316,7 @@ where
                 &Certificate(signed_by),
                 app_handler.clone(),
                 signature_verifiers,
+                CERT_CHAIN_MAX_DEPTH,
             )
             .await;
     }
