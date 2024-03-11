@@ -124,20 +124,20 @@ trait OnStartFn<Context> {
         &self,
         handler: AppHandler,
         context: Context,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
 impl<F, G, Context> OnStartFn<Context> for F
 where
     F: Send + Sync,
     F: Fn(AppHandler, Context) -> G,
-    G: Future<Output = ()> + 'static + Send + Sync,
+    G: Future<Output = ()> + 'static + Send,
 {
     fn run(
         &self,
         handler: AppHandler,
         context: Context,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + Sync>> {
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(self(handler, context))
     }
 }
