@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use bytes::{Buf, Bytes};
 use derive_more::Constructor;
 use futures::{future::BoxFuture, FutureExt};
-use log::{debug, trace};
 use ndn_protocol::{
     signature::{KeyLocatorData, SignMethod, SignatureVerifier, ToVerifier},
     Certificate, Data, DigestSha256, Interest,
@@ -293,7 +292,7 @@ where
         &self,
         interest: &Interest<Bytes>,
         _context: Arc<RwLock<TypeMap>>,
-        cert_store: Arc<RwLock<CertStore>>,
+        _cert_store: Arc<RwLock<CertStore>>,
         mut app_handler: AppHandler,
         signature_verifiers: &(dyn ToVerifier + Sync),
     ) -> bool {
@@ -302,11 +301,6 @@ where
             return true;
         }
 
-        let Some(anchor_cert) = self.0.certificate() else {
-            return false;
-        };
-        trace!("Anchor: {}", anchor_cert.name().to_uri());
-
         let Some(info) = interest.signature_info() else {
             return false;
         };
@@ -314,18 +308,15 @@ where
             return false;
         };
 
-        /////////
         let Some(locator_name) = locator.as_name() else {
             return false;
         };
-        debug!("Retrieving cert {}", locator_name.to_uri());
         let Ok(signed_by) = app_handler
             .express_interest_unsigned(Interest::<()>::new(locator_name.clone()))
             .await
         else {
             return false;
         };
-        println!("{:#?}", signed_by);
         return self
             .verify_signature(
                 &Certificate(signed_by),
@@ -333,67 +324,6 @@ where
                 signature_verifiers,
             )
             .await;
-        ////////
-
-        let mut certs_to_check = HashMap::new();
-        let mut next_cert = locator.clone();
-        let mut certs = cert_store.read().await;
-        loop {
-            if certs_to_check.contains_key(&next_cert) {
-                // Cycle in key chain
-                return false;
-            }
-            if next_cert
-                .as_name()
-                .is_some_and(|x| anchor_cert.name().has_prefix(x))
-            {
-                // Next cert is trust anchor
-                break;
-            }
-            let Some(cert) = certs.certs.get(&next_cert) else {
-                // Signed by unknown certificate
-                return false;
-            };
-
-            let Some(cur_cert) = cert.certificate() else {
-                return false;
-            };
-
-            let Some(cur_info) = cur_cert.signature_info() else {
-                return false;
-            };
-            certs_to_check.insert(next_cert, cert);
-            let Some(next_locator) = cur_info.key_locator() else {
-                return false;
-            };
-            next_cert = next_locator.locator().clone();
-        }
-
-        debug!("{:?}", certs_to_check.keys());
-
-        for (_, cert) in &certs_to_check {
-            let certificate = cert.certificate().unwrap();
-            let data = certificate.as_data();
-            let signature_info = data.signature_info().unwrap();
-            let locator = signature_info.key_locator().unwrap();
-
-            if let Some(signer) = certs_to_check.get(locator.locator()) {
-                if data.verify_with_sign_method(&***signer).is_err()
-                    && data.verify_with_sign_method(&self.0).is_err()
-                {
-                    trace!("a");
-                    return false;
-                }
-            } else {
-                if data.verify_with_sign_method(&self.0).is_err() {
-                    trace!("b");
-                    trace!("Failed to verify: {:#?}", data);
-                    return false;
-                }
-            }
-        }
-
-        true
     }
 }
 
