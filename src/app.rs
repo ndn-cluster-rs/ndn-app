@@ -180,6 +180,7 @@ pub struct AppHandler {
     interest_sender: mpsc::Sender<InterestToSend<Bytes>>,
     in_handler: broadcast::Sender<Packet>,
     verifier_context: Arc<RwLock<TypeMap>>,
+    known_verifiers: Arc<dyn ToVerifier + Send + Sync + 'static>,
 }
 
 impl AppHandler {
@@ -237,7 +238,12 @@ impl AppHandler {
                     Packet::Data(packet) => {
                         if packet.matches_interest(&interest) {
                             if verifier
-                                .verify(&packet, Arc::clone(&self.verifier_context))
+                                .verify(
+                                    &packet,
+                                    Arc::clone(&self.verifier_context),
+                                    self.clone(),
+                                    &*self.known_verifiers,
+                                )
                                 .await
                             {
                                 return Ok(packet);
@@ -498,6 +504,7 @@ where
             interest_sender,
             in_handler: in_sender.clone(),
             verifier_context: Arc::clone(&self.verifier_context),
+            known_verifiers: Arc::<Verifiers>::clone(&self.known_verifiers),
         };
 
         if let Some(on_start) = self.on_start.take() {

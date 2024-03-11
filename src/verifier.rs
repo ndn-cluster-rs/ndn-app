@@ -40,7 +40,13 @@ pub trait InterestVerifier {
 
 #[async_trait]
 pub trait DataVerifier {
-    async fn verify(&self, data: &Data<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool;
+    async fn verify(
+        &self,
+        data: &Data<Bytes>,
+        context: Arc<RwLock<TypeMap>>,
+        mut app_handler: AppHandler,
+        signature_verifiers: &(dyn ToVerifier + Sync),
+    ) -> bool;
 }
 
 pub trait VerifierEx: Sized {
@@ -60,7 +66,13 @@ impl VerifierEx for AllowAll {}
 
 #[async_trait]
 impl DataVerifier for AllowAll {
-    async fn verify(&self, _data: &Data<Bytes>, _context: Arc<RwLock<TypeMap>>) -> bool {
+    async fn verify(
+        &self,
+        _data: &Data<Bytes>,
+        _context: Arc<RwLock<TypeMap>>,
+        _app_handler: AppHandler,
+        _signature_verifiers: &(dyn ToVerifier + Sync),
+    ) -> bool {
         true
     }
 }
@@ -83,7 +95,13 @@ pub struct ForbidAll;
 
 #[async_trait]
 impl DataVerifier for ForbidAll {
-    async fn verify(&self, _data: &Data<Bytes>, _context: Arc<RwLock<TypeMap>>) -> bool {
+    async fn verify(
+        &self,
+        _data: &Data<Bytes>,
+        _context: Arc<RwLock<TypeMap>>,
+        _app_handler: AppHandler,
+        _signature_verifiers: &(dyn ToVerifier + Sync),
+    ) -> bool {
         false
     }
 }
@@ -112,9 +130,26 @@ where
     T: DataVerifier + Sync,
     U: DataVerifier + Sync,
 {
-    async fn verify(&self, data: &Data<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
-        let res1 = self.0.verify(data, Arc::clone(&context)).await;
-        let res2 = self.1.verify(data, context).await;
+    async fn verify(
+        &self,
+        data: &Data<Bytes>,
+        context: Arc<RwLock<TypeMap>>,
+        app_handler: AppHandler,
+        signature_verifiers: &(dyn ToVerifier + Sync),
+    ) -> bool {
+        let res1 = self
+            .0
+            .verify(
+                data,
+                Arc::clone(&context),
+                app_handler.clone(),
+                signature_verifiers,
+            )
+            .await;
+        let res2 = self
+            .1
+            .verify(data, context, app_handler.clone(), signature_verifiers)
+            .await;
         res1 || res2
     }
 }
@@ -160,9 +195,26 @@ where
     T: DataVerifier + Sync,
     U: DataVerifier + Sync,
 {
-    async fn verify(&self, data: &Data<Bytes>, context: Arc<RwLock<TypeMap>>) -> bool {
-        let res1 = self.0.verify(data, Arc::clone(&context)).await;
-        let res2 = self.1.verify(data, context).await;
+    async fn verify(
+        &self,
+        data: &Data<Bytes>,
+        context: Arc<RwLock<TypeMap>>,
+        app_handler: AppHandler,
+        signature_verifiers: &(dyn ToVerifier + Sync),
+    ) -> bool {
+        let res1 = self
+            .0
+            .verify(
+                data,
+                Arc::clone(&context),
+                app_handler.clone(),
+                signature_verifiers,
+            )
+            .await;
+        let res2 = self
+            .1
+            .verify(data, context, app_handler.clone(), signature_verifiers)
+            .await;
         res1 && res2
     }
 }
@@ -228,8 +280,7 @@ where
                 return false;
             };
 
-            let Some(KeyLocatorData::Name(locator)) = info.key_locator().map(|x| x.locator())
-            else {
+            let Some(KeyLocatorData::Name(locator)) = info.key_locator() else {
                 return false;
             };
 
@@ -327,8 +378,49 @@ impl<Method> DataVerifier for RequireValidSignature<Method>
 where
     Method: SignatureVerifier + Send + Sync,
 {
-    async fn verify(&self, data: &Data<Bytes>, _context: Arc<RwLock<TypeMap>>) -> bool {
-        data.verify_with_sign_method(&self.0).is_ok()
+    async fn verify(
+        &self,
+        data: &Data<Bytes>,
+        _context: Arc<RwLock<TypeMap>>,
+        mut app_handler: AppHandler,
+        signature_verifiers: &(dyn ToVerifier + Sync),
+    ) -> bool {
+        const CERT_CHAIN_MAX_DEPTH: usize = 16;
+
+        let verified = data.verify_with_sign_method(&self.0).is_ok();
+        if verified {
+            return true;
+        }
+
+        let Some(info) = data.signature_info() else {
+            return false;
+        };
+        let Some(locator) = info.key_locator() else {
+            return false;
+        };
+
+        let Some(locator_name) = locator.as_name() else {
+            return false;
+        };
+
+        let Ok(signed_by) = app_handler
+            .express_interest_unsigned(
+                Interest::<()>::new(locator_name.clone()),
+                AllowAll, // SECURITY: We do custom verification
+            )
+            .await
+        else {
+            return false;
+        };
+
+        return self
+            .verify_signature(
+                &Certificate(signed_by),
+                app_handler.clone(),
+                signature_verifiers,
+                CERT_CHAIN_MAX_DEPTH,
+            )
+            .await;
     }
 }
 
@@ -356,7 +448,13 @@ impl InterestVerifier for ForbidDigestSignature {
 
 #[async_trait]
 impl DataVerifier for ForbidDigestSignature {
-    async fn verify(&self, data: &Data<Bytes>, _context: Arc<RwLock<TypeMap>>) -> bool {
+    async fn verify(
+        &self,
+        data: &Data<Bytes>,
+        _context: Arc<RwLock<TypeMap>>,
+        _app_handler: AppHandler,
+        _signature_verifiers: &(dyn ToVerifier + Sync),
+    ) -> bool {
         if let Some(info) = data.signature_info() {
             info.signature_type().value() != ndn_protocol::DigestSha256::SIGNATURE_TYPE
         } else {
@@ -385,7 +483,13 @@ impl InterestVerifier for ForbidUnsigned {
 
 #[async_trait]
 impl DataVerifier for ForbidUnsigned {
-    async fn verify(&self, data: &Data<Bytes>, _context: Arc<RwLock<TypeMap>>) -> bool {
+    async fn verify(
+        &self,
+        data: &Data<Bytes>,
+        _context: Arc<RwLock<TypeMap>>,
+        _app_handler: AppHandler,
+        _signature_verifiers: &(dyn ToVerifier + Sync),
+    ) -> bool {
         data.signature_info().is_some()
     }
 }
