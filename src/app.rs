@@ -1,10 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
-    future::Future,
-    marker::PhantomData,
-    pin::Pin,
-    sync::Arc,
-    time::Duration,
+    collections::BTreeMap, future::Future, marker::PhantomData, pin::Pin, sync::Arc, time::Duration,
 };
 
 use async_trait::async_trait;
@@ -13,7 +8,7 @@ use log::{debug, error, info, trace, warn};
 use ndn_ndnlp::{FragCount, FragIndex, Fragment, LpPacket, Packet, Sequence};
 use ndn_nfd_mgmt::{make_command, ControlParameters, ControlResponse};
 use ndn_protocol::{
-    signature::{KeyLocatorData, KnownVerifiers, SignMethod, SignatureVerifier, ToVerifier},
+    signature::{KnownVerifiers, SignMethod, ToVerifier},
     Data, Interest, Name, SignSettings,
 };
 use ndn_tlv::{NonNegativeInteger, TlvDecode, TlvEncode};
@@ -24,12 +19,7 @@ use tokio::{
 };
 use type_map::concurrent::TypeMap;
 
-use crate::{
-    error::Error,
-    util::add_bytes,
-    verifier::{CertStore, InterestVerifier},
-    DataExt, Result, ToName,
-};
+use crate::{error::Error, util::add_bytes, verifier::InterestVerifier, DataExt, Result, ToName};
 
 #[derive(Debug, Clone)]
 enum Connector {
@@ -157,18 +147,13 @@ pub struct RouteHandler<Context> {
     verifier: Box<dyn InterestVerifier + Send + Sync>,
 }
 
-type InitialisedApp<Signer, Context, Verifiers> = App<
-    Signer,
-    Context,
-    Verifiers,
-    Arc<RwLock<BTreeMap<Name, RouteHandler<Context>>>>,
-    Arc<RwLock<CertStore>>,
->;
+type InitialisedApp<Signer, Context, Verifiers> =
+    App<Signer, Context, Verifiers, Arc<RwLock<BTreeMap<Name, RouteHandler<Context>>>>>;
 
 type UninitialisedApp<Signer, Context, Verifiers> =
-    App<Signer, Context, Verifiers, BTreeMap<Name, RouteHandler<Context>>, CertStore>;
+    App<Signer, Context, Verifiers, BTreeMap<Name, RouteHandler<Context>>>;
 
-pub struct App<Signer, Context, KnownVerifiers, Routes, CS> {
+pub struct App<Signer, Context, KnownVerifiers, Routes> {
     routes: Routes,
     on_start: Option<Box<dyn OnStartFn<Context>>>,
     connector: Connector,
@@ -176,7 +161,6 @@ pub struct App<Signer, Context, KnownVerifiers, Routes, CS> {
     verifier_context: Arc<RwLock<TypeMap>>,
     context: Context,
     mtu: usize,
-    cert_store: CS,
     known_verifiers: Arc<KnownVerifiers>,
 }
 
@@ -294,9 +278,6 @@ where
             verifier_context: Arc::new(RwLock::new(TypeMap::new())),
             context,
             mtu: 8800,
-            cert_store: CertStore {
-                certs: HashMap::new(),
-            },
             known_verifiers: Arc::new(KnownVerifiers),
         }
     }
@@ -351,15 +332,6 @@ where
         self.initialise().start().await
     }
 
-    pub fn add_cert(
-        mut self,
-        locator: KeyLocatorData,
-        verifier: Box<dyn SignatureVerifier + Send + Sync>,
-    ) -> Self {
-        self.cert_store.certs.insert(locator, verifier);
-        self
-    }
-
     fn initialise(self) -> InitialisedApp<Signer, Context, Verifiers> {
         App {
             routes: Arc::new(RwLock::new(self.routes)),
@@ -369,7 +341,6 @@ where
             verifier_context: self.verifier_context,
             context: self.context,
             mtu: self.mtu,
-            cert_store: Arc::new(RwLock::new(self.cert_store)),
             known_verifiers: self.known_verifiers,
         }
     }
@@ -387,7 +358,6 @@ where
         verifier_context: Arc<RwLock<TypeMap>>,
         app_handler: AppHandler,
         signer: Arc<RwLock<Signer>>,
-        cert_store: Arc<RwLock<CertStore>>,
         out_sender: mpsc::Sender<Packet>,
         context: Context,
         known_verifiers: Arc<Verifiers>,
@@ -405,7 +375,6 @@ where
                     .verify(
                         &interest,
                         Arc::clone(&verifier_context),
-                        Arc::clone(&cert_store),
                         app_handler.clone(),
                         &*known_verifiers,
                     )
@@ -528,7 +497,6 @@ where
                             Arc::clone(&self.verifier_context),
                             app_handler.clone(),
                             Arc::clone(&self.signer),
-                            Arc::clone(&self.cert_store),
                             out_sender.clone(),
                             self.context.clone(),
                             Arc::clone(&self.known_verifiers),
