@@ -234,7 +234,10 @@ where
             }
 
             let Ok(signer) = app_handler
-                .express_interest_unsigned(Interest::<()>::new(locator.clone()))
+                .express_interest_unsigned(
+                    Interest::<()>::new(locator.clone()),
+                    AllowAll, // SECURITY: We do custom verification
+                )
                 .await
             else {
                 return false;
@@ -288,7 +291,10 @@ where
             return false;
         };
         let Ok(signed_by) = app_handler
-            .express_interest_unsigned(Interest::<()>::new(locator_name.clone()))
+            .express_interest_unsigned(
+                Interest::<()>::new(locator_name.clone()),
+                AllowAll, // SECURITY: We do custom verification
+            )
             .await
         else {
             return false;

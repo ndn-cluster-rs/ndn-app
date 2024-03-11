@@ -19,7 +19,12 @@ use tokio::{
 };
 use type_map::concurrent::TypeMap;
 
-use crate::{error::Error, util::add_bytes, verifier::InterestVerifier, DataExt, Result, ToName};
+use crate::{
+    error::Error,
+    util::add_bytes,
+    verifier::{DataVerifier, InterestVerifier},
+    DataExt, Result, ToName,
+};
 
 #[derive(Debug, Clone)]
 enum Connector {
@@ -174,32 +179,36 @@ struct InterestToSend<T> {
 pub struct AppHandler {
     interest_sender: mpsc::Sender<InterestToSend<Bytes>>,
     in_handler: broadcast::Sender<Packet>,
+    verifier_context: Arc<RwLock<TypeMap>>,
 }
 
 impl AppHandler {
     pub async fn express_interest<T>(
         &mut self,
         interest: impl std::borrow::Borrow<Interest<T>>,
+        verifier: impl DataVerifier,
     ) -> Result<Data<Bytes>>
     where
         T: TlvEncode + TlvDecode + Clone,
     {
-        self.express_interest_impl(interest, true).await
+        self.express_interest_impl(interest, verifier, true).await
     }
 
     pub async fn express_interest_unsigned<T>(
         &mut self,
         interest: impl std::borrow::Borrow<Interest<T>>,
+        verifier: impl DataVerifier,
     ) -> Result<Data<Bytes>>
     where
         T: TlvEncode + TlvDecode + Clone,
     {
-        self.express_interest_impl(interest, false).await
+        self.express_interest_impl(interest, verifier, false).await
     }
 
     async fn express_interest_impl<T>(
         &mut self,
         interest: impl std::borrow::Borrow<Interest<T>>,
+        verifier: impl DataVerifier,
         sign: bool,
     ) -> Result<Data<Bytes>>
     where
@@ -227,7 +236,18 @@ impl AppHandler {
                 match packet {
                     Packet::Data(packet) => {
                         if packet.matches_interest(&interest) {
-                            return Ok(packet);
+                            if verifier
+                                .verify(&packet, Arc::clone(&self.verifier_context))
+                                .await
+                            {
+                                return Ok(packet);
+                            } else {
+                                warn!(
+                                    "Data packet for {} failed verification.",
+                                    interest.name().to_uri()
+                                );
+                                return Err(Error::VerificationFailed);
+                            }
                         }
                     }
                     Packet::LpPacket(packet) => {
@@ -477,6 +497,7 @@ where
         let app_handler = AppHandler {
             interest_sender,
             in_handler: in_sender.clone(),
+            verifier_context: Arc::clone(&self.verifier_context),
         };
 
         if let Some(on_start) = self.on_start.take() {
