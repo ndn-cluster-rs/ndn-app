@@ -17,6 +17,7 @@ use tokio::{
     net::UnixStream,
     sync::{self, broadcast, mpsc, RwLock},
 };
+use tokio_util::sync::CancellationToken;
 use type_map::concurrent::TypeMap;
 
 use crate::{
@@ -57,14 +58,14 @@ where
         context: Context,
     ) -> std::result::Result<Option<Data<Bytes>>, ()> {
         let has_params = interest.application_parameters().is_some();
-        let input_interest = interest.application_parameters_decode();
+        let input_interest = interest.decode_application_parameters();
         if has_params && input_interest.application_parameters().is_none() {
             return Err(());
         }
         Ok(
             InterestCallback::run(self, handler, input_interest, context)
                 .await
-                .map(|x| x.content_encode()),
+                .map(|x| x.encode_content()),
         )
     }
 }
@@ -181,9 +182,14 @@ pub struct AppHandler {
     in_handler: broadcast::Sender<Packet>,
     verifier_context: Arc<RwLock<TypeMap>>,
     known_verifiers: Arc<dyn ToVerifier + Send + Sync + 'static>,
+    shutdown_token: CancellationToken,
 }
 
 impl AppHandler {
+    pub fn shutdown(&self) {
+        self.shutdown_token.cancel();
+    }
+
     pub async fn express_interest<T>(
         &mut self,
         interest: impl std::borrow::Borrow<Interest<T>>,
@@ -459,6 +465,8 @@ where
             }
         };
 
+        let shutdown_token = CancellationToken::new();
+
         // Outgoing data sync
         let (out_sender, out_receiver) = mpsc::channel(128);
         // Incoming data distribution
@@ -505,6 +513,7 @@ where
             in_handler: in_sender.clone(),
             verifier_context: Arc::clone(&self.verifier_context),
             known_verifiers: Arc::<Verifiers>::clone(&self.known_verifiers),
+            shutdown_token: shutdown_token.clone(),
         };
 
         if let Some(on_start) = self.on_start.take() {
@@ -516,92 +525,105 @@ where
         let mut last_seq = BytesMut::new();
 
         'main_loop: loop {
-            match in_receiver.recv().await {
-                Ok(packet) => match packet {
-                    Packet::Interest(interest) => {
-                        tokio::spawn(Self::handle_interest(
-                            interest.clone(),
-                            Arc::clone(&self.routes),
-                            Arc::clone(&self.verifier_context),
-                            app_handler.clone(),
-                            Arc::clone(&self.signer),
-                            out_sender.clone(),
-                            self.context.clone(),
-                            Arc::clone(&self.known_verifiers),
-                        ));
-                    }
-                    Packet::LpPacket(packet) => {
-                        for header in packet.other_headers() {
-                            if header.is_critical() {
-                                // Unknown critical header - packet must be dropped
-                                continue 'main_loop;
+            tokio::select! {
+                _ = shutdown_token.cancelled() => {
+                    return Ok(());
+                }
+                received = in_receiver.recv() => {
+                    match received {
+                        Ok(packet) => match packet {
+                            Packet::Interest(interest) => {
+                                tokio::spawn(Self::handle_interest(
+                                    interest.clone(),
+                                    Arc::clone(&self.routes),
+                                    Arc::clone(&self.verifier_context),
+                                    app_handler.clone(),
+                                    Arc::clone(&self.signer),
+                                    out_sender.clone(),
+                                    self.context.clone(),
+                                    Arc::clone(&self.known_verifiers),
+                                ));
                             }
-                        }
+                            Packet::LpPacket(packet) => {
+                                for header in packet.other_headers() {
+                                    if header.is_critical() {
+                                        // Unknown critical header - packet must be dropped
+                                        continue 'main_loop;
+                                    }
+                                }
 
-                        if let Some((frag_idx, frag_cnt)) = packet.frag_info() {
-                            // sequence number is required
-                            let (Some(seq), Some(fragment)) = (packet.seq_num(), packet.fragment())
-                            else {
-                                partial_packet.clear();
-                                partial_count = 0;
-                                continue 'main_loop;
-                            };
+                                if let Some((frag_idx, frag_cnt)) = packet.frag_info() {
+                                    // sequence number is required
+                                    let (Some(seq), Some(fragment)) = (packet.seq_num(), packet.fragment())
+                                    else {
+                                        partial_packet.clear();
+                                        partial_count = 0;
+                                        continue 'main_loop;
+                                    };
 
-                            // Wrong fragment index
-                            if frag_idx.as_usize() != partial_packet.len() {
-                                partial_packet.clear();
-                                partial_count = 0;
-                                continue 'main_loop;
-                            }
-                            // New fragment
-                            if frag_idx.as_usize() == 0 {
-                                partial_count = frag_cnt.into();
-                                partial_packet.clear();
-                                partial_packet.reserve(frag_cnt.as_usize());
-                                last_seq = BytesMut::from(&seq[..]);
-                            // Wrong total fragment number
-                            } else if partial_count != frag_cnt.as_u64() {
-                                partial_packet.clear();
-                                partial_count = 0;
-                                continue 'main_loop;
-                            } else {
-                                add_bytes(&mut last_seq, 1);
-                                // Sequence number not consecutive
-                                if last_seq != seq {
-                                    add_bytes(&mut last_seq, -1);
-                                    partial_packet.clear();
-                                    partial_count = 0;
-                                    continue 'main_loop;
+                                    // Wrong fragment index
+                                    if frag_idx.as_usize() != partial_packet.len() {
+                                        partial_packet.clear();
+                                        partial_count = 0;
+                                        continue 'main_loop;
+                                    }
+                                    // New fragment
+                                    if frag_idx.as_usize() == 0 {
+                                        partial_count = frag_cnt.into();
+                                        partial_packet.clear();
+                                        partial_packet.reserve(frag_cnt.as_usize());
+                                        last_seq = BytesMut::from(&seq[..]);
+                                    // Wrong total fragment number
+                                    } else if partial_count != frag_cnt.as_u64() {
+                                        partial_packet.clear();
+                                        partial_count = 0;
+                                        continue 'main_loop;
+                                    } else {
+                                        add_bytes(&mut last_seq, 1);
+                                        // Sequence number not consecutive
+                                        if last_seq != seq {
+                                            add_bytes(&mut last_seq, -1);
+                                            partial_packet.clear();
+                                            partial_count = 0;
+                                            continue 'main_loop;
+                                        }
+                                    }
+
+                                    partial_packet.push(fragment);
+                                    if frag_idx == frag_cnt {
+                                        let total_size: usize = partial_packet.iter().map(Bytes::len).sum();
+                                        let mut data = BytesMut::with_capacity(total_size);
+
+                                        for fragment in &partial_packet {
+                                            data.put(fragment.clone());
+                                        }
+                                        partial_packet.clear();
+                                        partial_count = 0;
+
+                                        let packet = Packet::decode(&mut data.freeze());
+                                        debug!("Reconstituted packet: {packet:#?}");
+                                    }
                                 }
                             }
-
-                            partial_packet.push(fragment);
-                            if frag_idx == frag_cnt {
-                                let total_size: usize = partial_packet.iter().map(Bytes::len).sum();
-                                let mut data = BytesMut::with_capacity(total_size);
-
-                                for fragment in &partial_packet {
-                                    data.put(fragment.clone());
-                                }
-                                partial_packet.clear();
-                                partial_count = 0;
-
-                                let packet = Packet::decode(&mut data.freeze());
-                                debug!("Reconstituted packet: {packet:#?}");
-                            }
+                            _ => {}
+                        },
+                        Err(broadcast::error::RecvError::Closed) => return Err(Error::ConnectionClosed),
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("Dropped {n} packets in routing handler");
                         }
                     }
-                    _ => {}
-                },
-                Err(broadcast::error::RecvError::Closed) => return Err(Error::ConnectionClosed),
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!("Dropped {n} packets in routing handler");
                 }
             }
         }
     }
 }
 
+/// Processes incoming interests
+async fn receive_interests_thread(receiver: broadcast::Receiver<Packet>) {
+    //
+}
+
+/// Processes interest send requests
 async fn interest_thread(
     sender: mpsc::Sender<Packet>,
     mut interest_receiver: mpsc::Receiver<InterestToSend<Bytes>>,
@@ -625,6 +647,7 @@ async fn interest_thread(
     Err(Error::ConnectionClosed)
 }
 
+/// Sends packets out onto the network
 async fn write_thread(
     mut writer: impl AsyncWrite + Unpin,
     mut receiver: mpsc::Receiver<Packet>,
@@ -670,6 +693,7 @@ async fn write_thread(
     Err(Error::ConnectionClosed)
 }
 
+/// Reads packets from the network
 async fn read_thread(
     mut reader: impl AsyncRead + Unpin,
     sender: broadcast::Sender<Packet>,
@@ -706,7 +730,7 @@ async fn register_route(
         match receiver.recv().await {
             Ok(Packet::Data(packet)) => {
                 if packet.name().has_prefix(&interest.name()) {
-                    let data = packet.content_decode::<ControlResponse<ControlParameters>>();
+                    let data = packet.decode_content::<ControlResponse<ControlParameters>>();
                     if let Some(content) = data.content() {
                         if content.status_code().as_usize() != 200 {
                             error!("Registering {route} failed with status code {status_code}: {status_text}",

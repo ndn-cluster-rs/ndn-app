@@ -286,7 +286,7 @@ where
 
             if anchor_cert.name().has_prefix(locator) {
                 // Signed by anchor
-                return cert.as_data().verify_with_sign_method(&self.0).is_ok();
+                return cert.as_data().verify(&self.0).is_ok();
             }
 
             let Ok(signer) = app_handler
@@ -318,7 +318,7 @@ where
                 return false;
             };
 
-            cert.as_data().verify_with_sign_method(&*verifier).is_ok()
+            cert.as_data().verify(&*verifier).is_ok()
         }
         .boxed()
     }
@@ -338,7 +338,7 @@ where
     ) -> bool {
         const CERT_CHAIN_MAX_DEPTH: usize = 16;
 
-        let verified = interest.verify_with_verifier(&self.0).is_ok();
+        let verified = interest.verify(&self.0).is_ok();
         if verified {
             return true;
         }
@@ -387,7 +387,7 @@ where
     ) -> bool {
         const CERT_CHAIN_MAX_DEPTH: usize = 16;
 
-        let verified = data.verify_with_sign_method(&self.0).is_ok();
+        let verified = data.verify(&self.0).is_ok();
         if verified {
             return true;
         }
