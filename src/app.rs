@@ -472,8 +472,17 @@ where
         // Incoming data distribution
         let (in_sender, mut in_receiver) = broadcast::channel(128);
 
-        tokio::spawn(write_thread(writer, out_receiver, self.mtu));
-        tokio::spawn(read_thread(reader, in_sender.clone()));
+        tokio::spawn(write_thread(
+            writer,
+            out_receiver,
+            self.mtu,
+            shutdown_token.clone(),
+        ));
+        tokio::spawn(read_thread(
+            reader,
+            in_sender.clone(),
+            shutdown_token.clone(),
+        ));
 
         for (route, _) in self.routes.read().await.iter() {
             let res = tokio::time::timeout(
@@ -506,6 +515,7 @@ where
             out_sender.clone(),
             interest_receiver,
             Arc::clone(&self.signer),
+            shutdown_token.clone(),
         ));
 
         let app_handler = AppHandler {
@@ -618,17 +628,14 @@ where
     }
 }
 
-/// Processes incoming interests
-async fn receive_interests_thread(receiver: broadcast::Receiver<Packet>) {
-    //
-}
-
 /// Processes interest send requests
 async fn interest_thread(
     sender: mpsc::Sender<Packet>,
     mut interest_receiver: mpsc::Receiver<InterestToSend<Bytes>>,
     signer: Arc<RwLock<impl SignMethod>>,
+    shutdown_token: CancellationToken,
 ) -> Result<()> {
+    let _shutdown_guard = shutdown_token.drop_guard();
     while let Some(mut interest_to_send) = interest_receiver.recv().await {
         if interest_to_send.sign {
             let mut signer = signer.write().await;
@@ -652,7 +659,9 @@ async fn write_thread(
     mut writer: impl AsyncWrite + Unpin,
     mut receiver: mpsc::Receiver<Packet>,
     mtu: usize,
+    shutdown_token: CancellationToken,
 ) -> Result<()> {
+    let _shutdown_guard = shutdown_token.drop_guard();
     let mut seq_num = BytesMut::from(&[0; 8][..]);
 
     while let Some(packet) = receiver.recv().await {
@@ -697,7 +706,9 @@ async fn write_thread(
 async fn read_thread(
     mut reader: impl AsyncRead + Unpin,
     sender: broadcast::Sender<Packet>,
+    shutdown_token: CancellationToken,
 ) -> Result<()> {
+    let _shutdown_guard = shutdown_token.drop_guard();
     while let Some(packet) = Packet::from_async_reader(&mut reader).await {
         sender.send(packet).map_err(|_| Error::ConnectionClosed)?;
     }
