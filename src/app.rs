@@ -637,7 +637,7 @@ async fn interest_thread(
 ) -> Result<()> {
     let _shutdown_guard = shutdown_token.drop_guard();
     while let Some(mut interest_to_send) = interest_receiver.recv().await {
-        if interest_to_send.sign {
+        if interest_to_send.sign && !interest_to_send.interest.is_signed() {
             let mut signer = signer.write().await;
             interest_to_send
                 .interest
