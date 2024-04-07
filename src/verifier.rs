@@ -5,7 +5,7 @@ use bytes::{Buf, Bytes};
 use derive_more::Constructor;
 use futures::{future::BoxFuture, FutureExt};
 use ndn_protocol::{
-    signature::{KeyLocatorData, SignMethod, SignatureVerifier, ToVerifier},
+    signature::{KeyLocatorData, SignMethod, ToVerifier},
     Certificate, Data, DigestSha256, Interest,
 };
 use tokio::sync::RwLock;
@@ -15,17 +15,18 @@ use crate::app::AppHandler;
 
 /// A simple verifier that will allow unsigned and signed interests, but will make sure a
 /// DigestSha256-signed interest has a valid digest
-pub const SIMPLE_VERIFIER: OrVerifier<ForbidDigestSignature, RequireValidSignature<DigestSha256>> =
+pub fn simple_verifier() -> OrVerifier<ForbidDigestSignature, RequireValidSignature> {
     OrVerifier(
         ForbidDigestSignature,
-        RequireValidSignature(DigestSha256::new()),
-    );
+        RequireValidSignature(DigestSha256::certificate()),
+    )
+}
 
 /// Same as `SIMPLE_VERIFIER`, but does not allow unsigned interests
-pub const SIMPLE_SIGNED: AndVerifier<
-    ForbidUnsigned,
-    OrVerifier<ForbidDigestSignature, RequireValidSignature<DigestSha256>>,
-> = AndVerifier(ForbidUnsigned, SIMPLE_VERIFIER);
+pub fn simple_signed(
+) -> AndVerifier<ForbidUnsigned, OrVerifier<ForbidDigestSignature, RequireValidSignature>> {
+    AndVerifier(ForbidUnsigned, simple_verifier())
+}
 
 #[async_trait]
 pub trait InterestVerifier {
@@ -251,15 +252,10 @@ where
 
 impl<T, U> VerifierEx for AndVerifier<T, U> {}
 
-#[derive(Debug, Clone, Copy, Hash, Default)]
-pub struct RequireValidSignature<Method>(pub Method)
-where
-    Method: SignatureVerifier + Send + Sync;
+#[derive(Debug, Clone, Hash)]
+pub struct RequireValidSignature(pub Certificate);
 
-impl<Method> RequireValidSignature<Method>
-where
-    Method: SignatureVerifier + Send + Sync,
-{
+impl RequireValidSignature {
     fn verify_signature<'a>(
         &'a self,
         cert: &'a Certificate,
@@ -272,10 +268,6 @@ where
                 return false;
             }
 
-            let Some(anchor_cert) = self.0.certificate() else {
-                return false;
-            };
-
             let Some(info) = cert.signature_info() else {
                 return false;
             };
@@ -284,9 +276,12 @@ where
                 return false;
             };
 
-            if anchor_cert.name().has_prefix(locator) {
+            if self.0.name().has_prefix(locator) {
                 // Signed by anchor
-                return cert.as_data().verify(&self.0).is_ok();
+                let Some(verifier) = signature_verifiers.from_data(self.0 .0.clone()) else {
+                    return false;
+                };
+                return cert.as_data().verify(&*verifier).is_ok();
             }
 
             let Ok(signer) = app_handler
@@ -325,10 +320,7 @@ where
 }
 
 #[async_trait]
-impl<Method> InterestVerifier for RequireValidSignature<Method>
-where
-    Method: SignatureVerifier + Send + Sync,
-{
+impl InterestVerifier for RequireValidSignature {
     async fn verify(
         &self,
         interest: &Interest<Bytes>,
@@ -338,9 +330,10 @@ where
     ) -> bool {
         const CERT_CHAIN_MAX_DEPTH: usize = 16;
 
-        let verified = interest.verify(&self.0).is_ok();
-        if verified {
-            return true;
+        if let Some(verifier) = signature_verifiers.from_data(self.0 .0.clone()) {
+            if interest.verify(&*verifier).is_ok() {
+                return true;
+            }
         }
 
         let Some(info) = interest.signature_info() else {
@@ -374,10 +367,7 @@ where
 }
 
 #[async_trait]
-impl<Method> DataVerifier for RequireValidSignature<Method>
-where
-    Method: SignatureVerifier + Send + Sync,
-{
+impl DataVerifier for RequireValidSignature {
     async fn verify(
         &self,
         data: &Data<Bytes>,
@@ -387,9 +377,10 @@ where
     ) -> bool {
         const CERT_CHAIN_MAX_DEPTH: usize = 16;
 
-        let verified = data.verify(&self.0).is_ok();
-        if verified {
-            return true;
+        if let Some(verifier) = signature_verifiers.from_data(self.0 .0.clone()) {
+            if data.verify(&*verifier).is_ok() {
+                return true;
+            }
         }
 
         let Some(info) = data.signature_info() else {
@@ -424,7 +415,7 @@ where
     }
 }
 
-impl<T: SignatureVerifier + Send + Sync> VerifierEx for RequireValidSignature<T> {}
+impl VerifierEx for RequireValidSignature {}
 
 #[derive(Debug, Clone, Copy, Hash, Constructor, Default)]
 pub struct ForbidDigestSignature;
