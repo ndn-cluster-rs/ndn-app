@@ -42,7 +42,6 @@ impl DataExt for Packet {
         let mut header_bytes = Bytes::copy_from_slice(&header_buf);
 
         if bytes_read == 0 {
-            log::error!("Socket closed");
             return None;
         }
 
