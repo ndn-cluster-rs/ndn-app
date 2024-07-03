@@ -192,7 +192,7 @@ impl AppHandler {
 
     pub async fn express_interest<T>(
         &mut self,
-        interest: impl std::borrow::Borrow<Interest<T>>,
+        interest: impl std::borrow::BorrowMut<Interest<T>>,
         verifier: impl DataVerifier,
     ) -> Result<Data<Bytes>>
     where
@@ -203,7 +203,7 @@ impl AppHandler {
 
     pub async fn express_interest_unsigned<T>(
         &mut self,
-        interest: impl std::borrow::Borrow<Interest<T>>,
+        interest: impl std::borrow::BorrowMut<Interest<T>>,
         verifier: impl DataVerifier,
     ) -> Result<Data<Bytes>>
     where
@@ -214,14 +214,17 @@ impl AppHandler {
 
     async fn express_interest_impl<T>(
         &mut self,
-        interest: impl std::borrow::Borrow<Interest<T>>,
+        mut interest: impl std::borrow::BorrowMut<Interest<T>>,
         verifier: impl DataVerifier,
         sign: bool,
     ) -> Result<Data<Bytes>>
     where
         T: TlvEncode + TlvDecode + Clone,
     {
-        let interest = interest.borrow().clone().encode_application_parameters();
+        let mut interest = interest
+            .borrow_mut()
+            .clone()
+            .encode_application_parameters();
         let (notifier_sender, notifier_receiver) = sync::oneshot::channel();
         self.interest_sender
             .send(InterestToSend {
@@ -235,6 +238,8 @@ impl AppHandler {
         let signed_name = notifier_receiver
             .await
             .unwrap_or_else(|_| interest.name().clone());
+
+        interest.set_name(signed_name.clone());
 
         let lifetime = interest.interest_lifetime().map(u64::from).unwrap_or(3_000);
         let wait_for_data = async {
@@ -485,26 +490,28 @@ where
         ));
 
         for (route, _) in self.routes.read().await.iter() {
-            let res = tokio::time::timeout(
-                Duration::from_secs(3),
-                register_route(
-                    Arc::clone(&self.signer),
-                    in_sender.subscribe(),
-                    out_sender.clone(),
-                    route.clone(),
-                ),
-            )
-            .await;
+            loop {
+                let res = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    register_route(
+                        Arc::clone(&self.signer),
+                        in_sender.subscribe(),
+                        out_sender.clone(),
+                        route.clone(),
+                    ),
+                )
+                .await;
 
-            match res {
-                Ok(Ok(())) => (),
-                Ok(Err(x)) => {
-                    error!("Route registration had an error: {}", x);
-                    return Err(x);
-                }
-                Err(_) => {
-                    error!("Route registration timed out");
-                    return Err(Error::Timeout);
+                match res {
+                    Ok(Ok(())) => break,
+                    Ok(Err(x)) => {
+                        error!("Route registration had an error: {}", x);
+                        return Err(x);
+                    }
+                    Err(_) => {
+                        warn!("Route registration timed out");
+                        continue;
+                    }
                 }
             }
         }
