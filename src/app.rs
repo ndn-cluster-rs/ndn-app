@@ -418,7 +418,12 @@ where
                     .await
                 {
                     info!("Verification failed for request for {interest_uri}");
-                    continue;
+                    let nack = Packet::make_nack(interest);
+                    out_sender
+                        .send(nack)
+                        .await
+                        .map_err(|_| Error::ConnectionClosed)?;
+                    break;
                 }
                 if let Ok(ret) = route_handler
                     .callback
