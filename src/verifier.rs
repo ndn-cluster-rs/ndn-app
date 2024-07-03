@@ -5,7 +5,7 @@ use bytes::{Buf, Bytes};
 use derive_more::Constructor;
 use futures::{future::BoxFuture, FutureExt};
 use ndn_protocol::{
-    signature::{KeyLocatorData, SignMethod, SignMethodType as _, ToVerifier},
+    signature::{KeyLocatorData, SignMethodType as _, ToVerifier},
     Certificate, Data, DigestSha256, Interest,
 };
 use tokio::sync::RwLock;
