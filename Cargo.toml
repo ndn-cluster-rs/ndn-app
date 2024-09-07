@@ -1,7 +1,11 @@
 [package]
 name = "ndn-app"
+description = "Named Data Networking - main protocol parsing and encoding"
 version = "0.4.0"
 edition = "2021"
+license = "MIT"
+categories = ["network-programming"]
+keywords = ["ndn", "named", "data", "networking"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
