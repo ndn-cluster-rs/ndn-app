@@ -1,6 +1,6 @@
 [package]
 name = "ndn-app"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -11,10 +11,10 @@ bytes = "1.5.0"
 derive_more = "0.99.17"
 futures = "0.3.30"
 log = "0.4.20"
-ndn-ndnlp = { version = "0.1.0", path = "../ndn-ndnlp" }
-ndn-nfd-mgmt = { version = "0.1.0", path = "../ndn-nfd-mgmt" }
-ndn-protocol = { version = "0.3.0", path = "../ndn-protocol" }
-ndn-tlv = { version = "0.3.0", path = "../ndn-tlv" }
+ndn-ndnlp = { version = "0.4.0", path = "../ndn-ndnlp" }
+ndn-nfd-mgmt = { version = "0.4.0", path = "../ndn-nfd-mgmt" }
+ndn-protocol = { version = "0.4.0", path = "../ndn-protocol" }
+ndn-tlv = { version = "0.4.0", path = "../ndn-tlv" }
 thiserror = "1.0.57"
 tokio = { version = "1.36.0", features = ["net", "sync", "io-util", "time", "rt", "macros"] }
 tokio-util = "0.7.10"
