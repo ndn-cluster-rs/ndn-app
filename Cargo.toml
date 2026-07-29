@@ -15,10 +15,10 @@ bytes = "1.5.0"
 derive_more = "0.99.17"
 futures = "0.3.30"
 log = "0.4.20"
-ndn-ndnlp = { version = "0.4.0", path = "../ndn-ndnlp" }
-ndn-nfd-mgmt = { version = "0.4.0", path = "../ndn-nfd-mgmt" }
-ndn-protocol = { version = "0.4.0", path = "../ndn-protocol" }
-ndn-tlv = { version = "0.4.0", path = "../ndn-tlv" }
+ndn-ndnlp = "0.4.0"
+ndn-nfd-mgmt = "0.4.0"
+ndn-protocol = "0.4.0"
+ndn-tlv = "0.4.0"
 thiserror = "1.0.57"
 tokio = { version = "1.36.0", features = ["net", "sync", "io-util", "time", "rt", "macros"] }
 tokio-util = "0.7.10"
