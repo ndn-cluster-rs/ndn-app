@@ -1,3 +1,29 @@
+//! An application framework for building Named Data Networking (NDN)
+//! applications on top of [tokio], modeled after the producer/consumer
+//! split used by the NDN client libraries in other languages (ndn-cxx,
+//! python-ndn, etc).
+//!
+//! The framework owns the connection to a local NFD forwarder, route
+//! registration, Interest/Data matching and dispatch, and NDNLPv2
+//! link-layer framing, so application code only needs to describe routes
+//! and write async handlers for them. See [`app::App`] for the entry
+//! point and the crate's README for a worked example.
+//!
+//! ```rust,no_run
+//! use ndn_app::{app::App, verifier::ForbidUnsigned};
+//! use ndn_protocol::{Data, DigestSha256, Interest};
+//!
+//! # async fn run() {
+//! App::new(DigestSha256::new(), ())
+//!     .route("example", ForbidUnsigned, |_handler, interest: Interest<()>, _ctx| async move {
+//!         Some(Data::new(interest.name().clone(), ()))
+//!     })
+//!     .start()
+//!     .await
+//!     .unwrap();
+//! # }
+//! ```
+
 use bytes::{BufMut, Bytes, BytesMut};
 use error::Error;
 use log::warn;
@@ -11,8 +37,14 @@ pub mod error;
 mod util;
 pub mod verifier;
 
+/// The `Result` type returned by fallible operations across this crate,
+/// with the error type fixed to [`Error`] so callers don't need to name
+/// it at every call site.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Lets route names be given as either a [`Name`] or a plain `&str`
+/// (parsed with [`Name::from_str`]), so `App::route` doesn't force
+/// callers to construct a `Name` just to register a route by URI.
 trait ToName {
     fn to_name(self) -> Name;
 }
@@ -29,6 +61,15 @@ impl ToName for Name {
     }
 }
 
+/// Reads a single NDN [`Packet`] (Interest, Data, or NDNLPv2 frame) off
+/// an async byte stream.
+///
+/// This exists because packets on the wire are self-delimiting TLV, not
+/// length-prefixed, so the only way to know how many bytes to read is to
+/// decode the TLV header first and use its length field. Framing this way
+/// (peek header, then read exactly that many bytes) avoids buffering
+/// unbounded amounts of data from a slow or malicious peer before we know
+/// how much to expect.
 trait DataExt: Sized {
     async fn from_async_reader(reader: impl AsyncRead + Unpin) -> Option<Self>;
 }

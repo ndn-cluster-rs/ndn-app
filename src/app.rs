@@ -1,3 +1,44 @@
+//! The application runtime: connecting to NFD, registering routes,
+//! dispatching Interests to handlers, and expressing Interests as a
+//! consumer.
+//!
+//! [`App`] is a builder that only exposes route/lifecycle configuration
+//! before [`App::start`] is called; once started, it owns the
+//! connection to NFD and runs until shutdown or an unrecoverable error.
+//! [`AppHandler`] is the handle every route and lifecycle callback
+//! receives to talk back to the running app; see
+//! [`crate::verifier`] for how incoming Interests and outgoing Data are
+//! accepted or rejected.
+//!
+//! ```rust,no_run
+//! use ndn_app::{
+//!     app::{App, AppHandler},
+//!     verifier::ForbidUnsigned,
+//! };
+//! use ndn_protocol::{Data, DigestSha256, Interest};
+//!
+//! async fn hello(_handler: AppHandler, interest: Interest<()>, _ctx: ()) -> Option<Data<()>> {
+//!     Some(Data::new(interest.name().clone(), ()))
+//! }
+//!
+//! async fn on_start(mut handler: AppHandler, _ctx: ()) {
+//!     // AppHandler lets lifecycle callbacks act as consumers too.
+//!     let interest = Interest::<()>::new(
+//!         ndn_protocol::Name::from_str("hello").unwrap(),
+//!     );
+//!     let _ = handler.express_interest(interest, ForbidUnsigned).await;
+//! }
+//!
+//! # async fn run() {
+//! App::new(DigestSha256::new(), ())
+//!     .on_start(on_start)
+//!     .route("hello", ForbidUnsigned, hello)
+//!     .start()
+//!     .await
+//!     .unwrap();
+//! # }
+//! ```
+
 use std::{
     collections::BTreeMap, future::Future, marker::PhantomData, pin::Pin, sync::Arc, time::Duration,
 };
@@ -32,6 +73,18 @@ enum Connector {
     Unix(String),
 }
 
+// The four items below (InterestCallbackErased, InterestCallbackFunction,
+// IntoInterestCallbackFunction, InterestCallback) exist to let App::route
+// accept an ordinary `async fn(AppHandler, Interest<P>, Context) -> Option<Data<O>>`
+// for any P: TlvDecode and O: TlvEncode, while App itself stores a single
+// BTreeMap<Name, RouteHandler<Context>> whose entries don't carry P or O as
+// type parameters. InterestCallbackFunction<Params, Context, F> wraps a
+// closure to remember its P/O in its own type, InterestCallback erases that
+// down to a common associated-type interface, and InterestCallbackErased
+// erases it further to a single non-generic `run` that decodes raw
+// application parameter bytes into P and encodes the handler's O back into
+// bytes at the boundary. Without this, every route's handler type would need
+// to appear in App's own type parameters.
 #[async_trait]
 trait InterestCallbackErased<Context> {
     async fn run(
@@ -57,6 +110,10 @@ where
         interest: Interest<Bytes>,
         context: Context,
     ) -> std::result::Result<Option<Data<Bytes>>, ()> {
+        // Distinguish "no application parameters were sent" (fine, decodes
+        // to a default/empty value) from "application parameters were sent
+        // but didn't decode as this route's Params type" (a malformed
+        // request, not something the handler should see).
         let has_params = interest.application_parameters().is_some();
         let input_interest = interest.decode_application_parameters();
         if has_params && input_interest.application_parameters().is_none() {
@@ -148,17 +205,32 @@ where
     }
 }
 
+/// A single registered route: the verifier that gates it and the
+/// type-erased handler that runs once the verifier accepts an Interest.
 pub struct RouteHandler<Context> {
     callback: Box<dyn InterestCallbackErased<Context> + Send + Sync>,
     verifier: Box<dyn InterestVerifier + Send + Sync>,
 }
 
+// App is a typestate builder: `Routes` is `BTreeMap<...>` before `start()`
+// and `Arc<RwLock<BTreeMap<...>>>` after. UninitialisedApp only implements
+// `.route()` / `.on_start()` / `.mtu()`, and InitialisedApp only implements
+// the running event loop, so it's impossible to register a route (or call
+// `.start()` twice) on an app that's already running; the compiler rejects
+// it rather than it needing a runtime check.
+// This is not relevant in application code, as start() fully consumes the `App`.
 type InitialisedApp<Signer, Context, Verifiers> =
     App<Signer, Context, Verifiers, Arc<RwLock<BTreeMap<Name, RouteHandler<Context>>>>>;
 
 type UninitialisedApp<Signer, Context, Verifiers> =
     App<Signer, Context, Verifiers, BTreeMap<Name, RouteHandler<Context>>>;
 
+/// The application builder and, once started, runtime.
+///
+/// Construct with [`App::new`], configure with [`App::route`],
+/// [`App::on_start`], and [`App::mtu`], then call [`App::start`] to
+/// connect to NFD and begin serving. See the [module docs](self) for a
+/// full example.
 pub struct App<Signer, Context, KnownVerifiers, Routes> {
     routes: Routes,
     on_start: Option<Box<dyn OnStartFn<Context>>>,
@@ -176,6 +248,13 @@ struct InterestToSend<T> {
     notifier: tokio::sync::oneshot::Sender<Name>,
 }
 
+/// The handle passed into every route and lifecycle callback, giving
+/// application code a way to act as a consumer (express Interests, wait
+/// for the matching Data or NACK) and to shut the app down.
+///
+/// Cloning is cheap: every clone shares the same underlying channels and
+/// connection, so handing a clone to a spawned task or storing one in
+/// application state doesn't create a second connection to NFD.
 #[derive(Clone)]
 pub struct AppHandler {
     interest_sender: mpsc::Sender<InterestToSend<Bytes>>,
@@ -186,10 +265,17 @@ pub struct AppHandler {
 }
 
 impl AppHandler {
+    /// Signals the running [`App`] to stop. The current call to
+    /// [`App::start`] returns `Ok(())` once background tasks notice the
+    /// cancellation and exit; in-flight route handlers are not
+    /// interrupted.
     pub fn shutdown(&self) {
         self.shutdown_token.cancel();
     }
 
+    /// Signs `interest` and expresses it, returning the resulting Data
+    /// once it passes `verifier`, or an error on NACK, verification
+    /// failure, or timeout (see [`crate::error::Error`]).
     pub async fn express_interest<T>(
         &mut self,
         interest: impl std::borrow::BorrowMut<Interest<T>>,
@@ -201,6 +287,13 @@ impl AppHandler {
         self.express_interest_impl(interest, verifier, true).await
     }
 
+    /// Same as [`AppHandler::express_interest`], but sends the Interest
+    /// unsigned. Used internally by verifiers (see
+    /// [`crate::verifier::RequireValidSignature`]) to fetch certificates
+    /// without those fetches needing a signature of their own, and
+    /// available to application code for the same reason: fetching
+    /// public data that doesn't require proving the requester's
+    /// identity.
     pub async fn express_interest_unsigned<T>(
         &mut self,
         interest: impl std::borrow::BorrowMut<Interest<T>>,
@@ -306,6 +399,11 @@ where
     Signer: SignMethod + Send + Sync + 'static,
     Context: Clone + Send + 'static,
 {
+    /// Starts building an app that signs outgoing Data with `signer` and
+    /// clones `context` into every route and lifecycle callback.
+    ///
+    /// The NFD socket path is fixed to `/var/run/nfd/nfd.sock`, the
+    /// standard location for a local NFD install; it isn't configurable.
     pub fn new(signer: Signer, context: Context) -> Self {
         Self {
             routes: BTreeMap::new(),
@@ -326,6 +424,11 @@ where
     Context: Clone + Send + 'static,
     Verifiers: ToVerifier + Send + Sync + 'static,
 {
+    /// Registers `func` to handle Interests whose name has `name` as a
+    /// prefix, gated by `verifier`. Routes are stored in `Name` order and
+    /// matched in reverse, so where more than one registered prefix
+    /// matches an incoming Interest, the route that sorts last is tried
+    /// first (see the dispatch loop this feeds into, in `App::start`).
     #[allow(private_bounds)]
     pub fn route<Callback, Verifier, Params, Output, G>(
         mut self,
@@ -351,6 +454,10 @@ where
         self
     }
 
+    /// Registers `on_start` to run once routes are registered with NFD
+    /// and the app is ready to serve. This is the usual place to kick
+    /// off consumer-side work, since it's the first point at which
+    /// `AppHandler` is available.
     #[allow(private_bounds)]
     pub fn on_start<F>(mut self, on_start: F) -> Self
     where
@@ -360,11 +467,16 @@ where
         self
     }
 
+    /// Sets the maximum packet size in bytes before NDNLPv2 fragmentation
+    /// kicks in on send (default 8800, matching NDN's usual default MTU).
     pub fn mtu(mut self, mtu: usize) -> Self {
         self.mtu = mtu;
         self
     }
 
+    /// Connects to NFD, registers all configured routes, runs
+    /// `on_start`, and then serves until [`AppHandler::shutdown`] is
+    /// called or an unrecoverable connection error occurs.
     pub async fn start(self) -> Result<()> {
         self.initialise().start().await
     }
@@ -389,6 +501,17 @@ where
     Context: Clone + Send + 'static,
     Verifiers: ToVerifier + Send + Sync + 'static,
 {
+    /// Matches an incoming Interest against registered routes and drives
+    /// it through verification and the handler, sending back Data or a
+    /// NACK. Spawned as its own task per Interest by the main loop in
+    /// [`InitialisedApp::start`], so a slow handler for one Interest
+    /// doesn't hold up dispatch of the next.
+    ///
+    /// Routes are tried most-specific-first (see [`UninitialisedApp::route`])
+    /// and matching stops at the first route whose prefix matches,
+    /// whether or not that route ends up accepting the Interest; an
+    /// Interest that fails one route's verifier is NACKed rather than
+    /// falling through to try a less specific route.
     async fn handle_interest(
         interest: Interest<Bytes>,
         routes: Arc<RwLock<BTreeMap<Name, RouteHandler<Context>>>>,
@@ -458,6 +581,15 @@ where
         Ok(())
     }
 
+    /// Connects to NFD, spawns the read/write/interest-sending
+    /// background tasks, registers every route, runs `on_start`, and
+    /// then loops handling incoming packets until shutdown.
+    ///
+    /// Route registration happens with a per-route retry loop (see the
+    /// call to [`register_route`] below): NFD may not have finished
+    /// starting up, or a management Interest may simply be dropped, so a
+    /// registration that doesn't get a response within a few seconds is
+    /// retried rather than treated as a fatal error immediately.
     async fn start(mut self) -> Result<()> {
         let (reader, writer): (
             Box<dyn AsyncRead + Unpin + Send>,
@@ -640,7 +772,17 @@ where
     }
 }
 
-/// Processes interest send requests
+/// Signs and forwards Interests queued by [`AppHandler::express_interest`]
+/// and [`AppHandler::express_interest_unsigned`].
+///
+/// This runs as its own task, rather than signing inline in
+/// `AppHandler`, because signing needs exclusive access to the shared
+/// signer; funneling every outgoing Interest through one task avoids
+/// taking the signer's lock from arbitrarily many concurrent callers.
+/// The signed name is sent back over `notifier` before the Interest is
+/// handed to `write_thread`, since signing can change the Interest's
+/// name (it appends a digest component) and the caller needs the final
+/// name to match incoming Data against.
 async fn interest_thread(
     sender: mpsc::Sender<Packet>,
     mut interest_receiver: mpsc::Receiver<InterestToSend<Bytes>>,
@@ -666,7 +808,16 @@ async fn interest_thread(
     Err(Error::ConnectionClosed)
 }
 
-/// Sends packets out onto the network
+/// Serializes and writes every outgoing packet, splitting into NDNLPv2
+/// fragments when a packet is larger than `mtu`.
+///
+/// All writes to the connection funnel through this one task so packets
+/// aren't interleaved on the wire by concurrent writers; `AppHandler`
+/// and route handlers only ever hand packets to `out_sender` rather than
+/// writing directly. Fragments share one sequence number space (`seq_num`,
+/// incremented per fragment, not per packet) since that's what lets the
+/// receiving side detect gaps and out-of-order fragments during
+/// reassembly.
 async fn write_thread(
     mut writer: impl AsyncWrite + Unpin,
     mut receiver: mpsc::Receiver<Packet>,
@@ -714,7 +865,14 @@ async fn write_thread(
     Err(Error::ConnectionClosed)
 }
 
-/// Reads packets from the network
+/// Reads packets off the connection and broadcasts them to every
+/// subscriber (the main dispatch loop, and any in-flight
+/// `express_interest` calls waiting on a specific Data or NACK).
+///
+/// A broadcast channel, rather than a plain mpsc queue, is used because
+/// more than one place needs to see every incoming packet: the main
+/// loop for routing Interests, and potentially several concurrent
+/// `express_interest` calls each watching for their own Data.
 async fn read_thread(
     mut reader: impl AsyncRead + Unpin,
     sender: broadcast::Sender<Packet>,
@@ -727,6 +885,14 @@ async fn read_thread(
     Err(Error::ConnectionClosed)
 }
 
+/// Registers a single route prefix with NFD's RIB by sending a signed
+/// management Interest and waiting for its response.
+///
+/// This is a one-shot operation, not a background task: [`App::start`]
+/// awaits it once per route (with its own timeout and retry loop) before
+/// entering the main event loop, so a route is guaranteed to be
+/// registered with the forwarder before the app starts accepting
+/// application-level Interests.
 async fn register_route(
     signer: Arc<RwLock<impl SignMethod>>,
     mut receiver: broadcast::Receiver<Packet>,
