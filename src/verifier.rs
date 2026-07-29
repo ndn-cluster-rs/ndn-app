@@ -562,7 +562,7 @@ impl InterestVerifier for RequireValidNonce {
             return false;
         }
         used_nonces.nonces[used_nonces.buffer_pos] = Some(nonce.clone());
-        used_nonces.buffer_pos = used_nonces.buffer_pos + 1 % ValidNonceContext::BUFFER_SIZE;
+        used_nonces.buffer_pos = (used_nonces.buffer_pos + 1) % ValidNonceContext::BUFFER_SIZE;
         true
     }
 }
