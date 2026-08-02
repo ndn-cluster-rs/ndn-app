@@ -1,9 +1,10 @@
 [package]
 name = "ndn-app"
-description = "Named Data Networking - main protocol parsing and encoding"
-version = "0.4.0"
+description = "An application framework for building Named Data Networking (NDN) applications on top of tokio"
+version = "0.4.1"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/ndn-cluster-rs/ndn-app"
 categories = ["network-programming"]
 keywords = ["ndn", "named", "data", "networking"]
 
@@ -15,10 +16,10 @@ bytes = "1.5.0"
 derive_more = "0.99.17"
 futures = "0.3.30"
 log = "0.4.20"
-ndn-ndnlp = "0.4.0"
-ndn-nfd-mgmt = "0.4.0"
-ndn-protocol = "0.4.0"
-ndn-tlv = "0.4.0"
+ndn-ndnlp = { version = "0.4.1", path = "../ndn-ndnlp" }
+ndn-nfd-mgmt = { version = "0.4.1", path = "../ndn-nfd-mgmt" }
+ndn-protocol = { version = "0.4.1", path = "../ndn-protocol" }
+ndn-tlv = { version = "0.4.1", path = "../ndn-tlv" }
 thiserror = "1.0.57"
 tokio = { version = "1.36.0", features = ["net", "sync", "io-util", "time", "rt", "macros"] }
 tokio-util = "0.7.10"
